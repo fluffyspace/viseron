@@ -2,6 +2,7 @@ import Brightness4Icon from "@mui/icons-material/Brightness4";
 import Brightness7Icon from "@mui/icons-material/Brightness7";
 import LogoutIcon from "@mui/icons-material/Logout";
 import MenuIcon from "@mui/icons-material/Menu";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SettingsIcon from "@mui/icons-material/Settings";
 import Box from "@mui/material/Box";
 import Container from "@mui/material/Container";
@@ -12,7 +13,11 @@ import Typography from "@mui/material/Typography";
 import { alpha, styled, useTheme } from "@mui/material/styles";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import { useContext, useRef, useState } from "react";
-import { Link as RouterLink, useNavigate } from "react-router-dom";
+import {
+  Link as RouterLink,
+  useLocation,
+  useNavigate,
+} from "react-router-dom";
 import ViseronLogo from "svg/viseron-logo.svg?react";
 
 import Breadcrumbs from "components/header/Breadcrumbs";
@@ -23,6 +28,7 @@ import { ViseronContext } from "context/ViseronContext";
 import { useScrollPosition } from "hooks/UseScrollPosition";
 import { useToast } from "hooks/UseToast";
 import { useAuthLogout } from "lib/api/auth";
+import { restartViseron } from "lib/commands";
 
 interface HeaderProps {
   showHeader: boolean;
@@ -62,7 +68,9 @@ export default function AppHeader() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const lastTogglePos = useRef(0);
   const { auth, user } = useAuthContext();
-  const { safeMode } = useContext(ViseronContext);
+  const { safeMode, connection } = useContext(ViseronContext);
+  const location = useLocation();
+  const onSettingsPage = location.pathname === "/settings";
 
   useScrollPosition((prevPos: any, currPos: any) => {
     // Always show header if we haven't scrolled down more than theme.headerHeight
@@ -92,6 +100,14 @@ export default function AppHeader() {
   const logout = useAuthLogout();
   const navigate = useNavigate();
   const toast = useToast();
+
+  const handleRestart = () => {
+    if (!connection) return;
+    if (!window.confirm("Restart Viseron?")) return;
+    restartViseron(connection).catch(() => {
+      toast.error("Failed to restart Viseron");
+    });
+  };
 
   return (
     <>
@@ -169,15 +185,27 @@ export default function AppHeader() {
               </IconButton>
             </Tooltip>
             {!auth.enabled || (auth.enabled && user?.role) === "admin" ? (
-              <Tooltip title="Settings" enterDelay={300}>
-                <IconButton
-                  component={RouterLink}
-                  color="primary"
-                  to="/settings"
-                >
-                  <SettingsIcon />
-                </IconButton>
-              </Tooltip>
+              onSettingsPage ? (
+                <Tooltip title="Restart Viseron" enterDelay={300}>
+                  <IconButton
+                    color="primary"
+                    onClick={handleRestart}
+                    aria-label="Restart Viseron"
+                  >
+                    <RestartAltIcon />
+                  </IconButton>
+                </Tooltip>
+              ) : (
+                <Tooltip title="Settings" enterDelay={300}>
+                  <IconButton
+                    component={RouterLink}
+                    color="primary"
+                    to="/settings"
+                  >
+                    <SettingsIcon />
+                  </IconButton>
+                </Tooltip>
+              )
             ) : null}
             {auth.enabled && (
               <Tooltip title="Logout" enterDelay={300}>
