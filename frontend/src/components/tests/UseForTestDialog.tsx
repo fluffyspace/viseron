@@ -20,7 +20,7 @@ import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import { DateTimePicker } from "@mui/x-date-pickers/DateTimePicker";
 import { Dayjs } from "dayjs";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { useFilteredCameras } from "components/camera/useCameraStore";
 import { useCreateTestClip } from "lib/api/tests";
@@ -83,12 +83,11 @@ export function UseForTestDialog({
     [filteredCameras],
   );
 
-  // Default camera to the first selected one when the dialog opens.
-  useEffect(() => {
-    if (open && !cameraIdentifier && cameraOptions.length > 0) {
-      setCameraIdentifier(cameraOptions[0]);
-    }
-  }, [open, cameraIdentifier, cameraOptions]);
+  // Default camera to the first selected one while the user hasn't
+  // explicitly picked another. Derived during render instead of synced
+  // via an effect to avoid cascading re-renders.
+  const effectiveCameraIdentifier =
+    cameraIdentifier || cameraOptions[0] || "";
 
   const handleClose = () => {
     setOpen(false);
@@ -97,9 +96,9 @@ export function UseForTestDialog({
   };
 
   const handleSubmit = () => {
-    if (!startDate || !endDate || !cameraIdentifier || !name.trim()) return;
+    if (!startDate || !endDate || !effectiveCameraIdentifier || !name.trim()) return;
     const payload: types.TestClipCreateRequest = {
-      camera_identifier: cameraIdentifier,
+      camera_identifier: effectiveCameraIdentifier,
       start: startDate.unix(),
       end: endDate.unix(),
       name: name.trim(),
@@ -126,7 +125,7 @@ export function UseForTestDialog({
   const disabled =
     !startDate ||
     !endDate ||
-    !cameraIdentifier ||
+    !effectiveCameraIdentifier ||
     !name.trim() ||
     endDate.isBefore(startDate) ||
     createClip.isPending;
@@ -149,7 +148,7 @@ export function UseForTestDialog({
             <InputLabel>Camera</InputLabel>
             <Select
               label="Camera"
-              value={cameraIdentifier}
+              value={effectiveCameraIdentifier}
               onChange={(event: SelectChangeEvent) =>
                 setCameraIdentifier(event.target.value)
               }
