@@ -49,6 +49,12 @@ declare module "@mui/material/Typography" {
   }
 }
 
+declare module "@mui/material/Menu" {
+  interface MenuPaperSlotPropsOverrides {
+    "data-testid"?: string;
+  }
+}
+
 const blue = {
   50: "#F0F7FF",
   100: "#C2E0FF",
@@ -160,7 +166,12 @@ export function ColorModeProvider({ children }: ColorModeProviderProps) {
         },
 
         typography: {
+          fontFamily:
+            '"IBM Plex Sans Variable", "IBM Plex Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
           h5: {
+            color: requestedMode === "dark" ? blue[300] : blue.main,
+          },
+          h6: {
             color: requestedMode === "dark" ? blue[300] : blue.main,
           },
           uppercase: {
@@ -178,18 +189,21 @@ export function ColorModeProvider({ children }: ColorModeProviderProps) {
       components: {
         MuiCssBaseline: {
           styleOverrides: (themeParam: Theme) => ({
-            body:
-              themeParam.palette.mode === "dark"
-                ? darkScrollbar({
-                    track: "#0f2740",
-                    thumb: "#1f5286",
-                    active: "#2867a9",
-                  })
-                : darkScrollbar({
-                    track: "#f1f1f1",
-                    thumb: "#c1c1c1",
-                    active: "#a8a8a8",
-                  }),
+            ...(themeParam.palette.mode === "dark"
+              ? darkScrollbar({
+                  track: "#0f2740",
+                  thumb: "#1f5286",
+                  active: "#2867a9",
+                })
+              : darkScrollbar({
+                  track: "#f1f1f1",
+                  thumb: "#c1c1c1",
+                  active: "#a8a8a8",
+                })),
+            "*::-webkit-scrollbar": {
+              width: "13px",
+              height: "13px",
+            },
           }),
         },
         MuiContainer: {
@@ -250,7 +264,10 @@ export function ColorModeProvider({ children }: ColorModeProviderProps) {
                   ? theme.palette.primary[900]
                   : theme.palette.primary[200]
               }`,
-              boxShadow: "5px 5px 8px 0px rgba(0,0,0,0.40)",
+              boxShadow:
+                theme.palette.mode === "dark"
+                  ? "0px 4px 16px rgba(0, 0, 0, 0.32), 0px 2px 4px rgba(0, 0, 0, 0.24)"
+                  : "0px 2px 8px rgba(0, 0, 0, 0.08), 0px 1px 2px rgba(0, 0, 0, 0.04)",
             },
           },
         },
@@ -286,7 +303,10 @@ export function ColorModeProvider({ children }: ColorModeProviderProps) {
                   : theme.palette.primary[200]
               }`,
               color: theme.palette.text.primary,
-              boxShadow: "5px 5px 8px 0px rgba(0,0,0,0.40)",
+              boxShadow:
+                theme.palette.mode === "dark"
+                  ? "0px 4px 16px rgba(0, 0, 0, 0.32), 0px 2px 4px rgba(0, 0, 0, 0.24)"
+                  : "0px 2px 8px rgba(0, 0, 0, 0.08), 0px 1px 2px rgba(0, 0, 0, 0.04)",
             },
           },
         },

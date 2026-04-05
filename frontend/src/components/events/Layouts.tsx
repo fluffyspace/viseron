@@ -1,7 +1,7 @@
 import TabContext from "@mui/lab/TabContext";
 import TabList from "@mui/lab/TabList";
 import TabPanel from "@mui/lab/TabPanel";
-import Box from "@mui/material/Box";
+import Container from "@mui/material/Container";
 import Grid from "@mui/material/Grid";
 import Paper from "@mui/material/Paper";
 import Tab from "@mui/material/Tab";
@@ -106,7 +106,7 @@ const useSetPlayerCardHeight = (
 };
 
 type TabsProps = {
-  date: Dayjs | null;
+  date: Dayjs;
   selectedTab: "events" | "timeline";
   setSelectedTab: (tab: "events" | "timeline") => void;
   playerCardGridItemRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -178,7 +178,11 @@ function Tabs({
         {Object.keys(filteredCameras).length > 0 ? (
           <EventTable parentRef={eventsRef} date={date} />
         ) : (
-          <Typography align="center" sx={{ marginTop: "20px" }}>
+          <Typography
+            color="text.secondary"
+            align="center"
+            sx={{ marginTop: "20px" }}
+          >
             Select at least one camera to load Events
           </Typography>
         )}
@@ -203,7 +207,11 @@ function Tabs({
             date={date}
           />
         ) : (
-          <Typography align="center" sx={{ marginTop: "20px" }}>
+          <Typography
+            color="text.secondary"
+            align="center"
+            sx={{ marginTop: "20px" }}
+          >
             Select at least one camera to load Timeline
           </Typography>
         )}
@@ -213,8 +221,8 @@ function Tabs({
 }
 
 type LayoutProps = {
-  date: Dayjs | null;
-  setDate: (date: Dayjs | null) => void;
+  date: Dayjs;
+  setDate: (date: Dayjs) => void;
   selectedTab: "events" | "timeline";
   setSelectedTab: (tab: "events" | "timeline") => void;
 };
@@ -227,7 +235,7 @@ export const Layout = memo(
     useSetPlayerCardHeight(playerCardGridItemRef);
 
     return (
-      <Box>
+      <Container sx={{ paddingX: { xs: 1, md: 2 } }}>
         <Grid
           container
           direction="row"
@@ -255,8 +263,8 @@ export const Layout = memo(
               xs: 12,
               sm: 8,
               md: 8,
-              lg: 9,
-              xl: 10,
+              lg: 8.5,
+              xl: 9.5,
             }}
           >
             <PlayerCard />
@@ -266,8 +274,8 @@ export const Layout = memo(
               xs: 12,
               sm: 4,
               md: 4,
-              lg: 3,
-              xl: 2,
+              lg: 3.5,
+              xl: 2.5,
             }}
           >
             <Paper variant="outlined">
@@ -281,7 +289,7 @@ export const Layout = memo(
           </Grid>
           <FloatingMenu date={date} setDate={setDate} />
         </Grid>
-      </Box>
+      </Container>
     );
   },
 );

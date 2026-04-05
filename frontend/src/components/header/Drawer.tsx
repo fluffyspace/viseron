@@ -1,15 +1,16 @@
-import { SvgIconComponent } from "@mui/icons-material";
-import FactCheckIcon from "@mui/icons-material/FactCheck";
-import GitHubIcon from "@mui/icons-material/GitHub";
-import ImageSearchIcon from "@mui/icons-material/ImageSearch";
-import LiveTvIcon from "@mui/icons-material/LiveTv";
-import MenuBookIcon from "@mui/icons-material/MenuBook";
-import SettingsIcon from "@mui/icons-material/Settings";
-import VideoFileIcon from "@mui/icons-material/VideoFile";
-import VideocamIcon from "@mui/icons-material/Videocam";
-import ViewListIcon from "@mui/icons-material/ViewList";
-import ViewTimelineIcon from "@mui/icons-material/ViewTimeline";
-import VolunteerActivismIcon from "@mui/icons-material/VolunteerActivism";
+import {
+  Book,
+  Demo,
+  IntrusionPrevention,
+  LogoGithub,
+  Need,
+  Roadmap,
+  Settings,
+  TableSplit,
+  Tools,
+  Video,
+  VideoChat,
+} from "@carbon/icons-react";
 import Box from "@mui/material/Box";
 import Container from "@mui/material/Container";
 import Divider from "@mui/material/Divider";
@@ -20,10 +21,12 @@ import ListItemIcon from "@mui/material/ListItemIcon";
 import ListItemText from "@mui/material/ListItemText";
 import ListSubheader from "@mui/material/ListSubheader";
 import Typography from "@mui/material/Typography";
+import { useContext } from "react";
 import { Link, Location, useLocation } from "react-router-dom";
 import ViseronLogo from "svg/viseron-logo.svg?react";
 
 import { useAuthContext } from "context/AuthContext";
+import { ViseronContext } from "context/ViseronContext";
 import * as types from "lib/types";
 
 type DrawerItemHeader = { type: "header"; title: string };
@@ -32,7 +35,7 @@ type DrawerItemLink = {
   type: "link";
   path: string;
   title: string;
-  icon: SvgIconComponent;
+  icon: React.ComponentType<{ size?: number | string }>;
   external?: boolean;
 };
 
@@ -40,39 +43,44 @@ type DrawerItemDivider = { type: "divider" };
 
 type DrawerItemTypes = DrawerItemHeader | DrawerItemLink | DrawerItemDivider;
 
+type DrawerSections = {
+  topItems: Array<DrawerItemTypes>;
+  bottomItems: Array<DrawerItemTypes>;
+};
+
 const getDrawerItems = (
   auth: types.AuthEnabledResponse,
   user: types.AuthUserResponse | null,
-) => {
-  const drawerItems: Array<DrawerItemTypes> = [
+): DrawerSections => {
+  const topItems: Array<DrawerItemTypes> = [
     { type: "header", title: "Pages" },
-    { type: "link", title: "Cameras", icon: VideocamIcon, path: "/" },
+    { type: "link", title: "Cameras", icon: Video, path: "/" },
     {
       type: "link",
       title: "Recordings",
-      icon: VideoFileIcon,
+      icon: Demo,
       path: "/recordings",
     },
     {
       type: "link",
       title: "Events",
-      icon: ImageSearchIcon,
+      icon: IntrusionPrevention,
       path: "/events?tab=events",
     },
     {
       type: "link",
       title: "Timeline",
-      icon: ViewTimelineIcon,
+      icon: Roadmap,
       path: "/events?tab=timeline",
     },
     {
       type: "link",
-      title: "Live",
-      icon: LiveTvIcon,
+      title: "Live View",
+      icon: VideoChat,
       path: "/live",
     },
-    { type: "link", title: "Entities", icon: ViewListIcon, path: "/entities" },
-    { type: "link", title: "Tests", icon: FactCheckIcon, path: "/tests" },
+    { type: "link", title: "Entities", icon: TableSplit, path: "/entities" },
+    { type: "link", title: "Tests", icon: Tools, path: "/tests" },
     ...(!auth.enabled || (auth.enabled && user?.role === "admin")
       ? [
           { type: "divider" } as DrawerItemTypes,
@@ -80,7 +88,7 @@ const getDrawerItems = (
           {
             type: "link",
             title: "Settings",
-            icon: SettingsIcon,
+            icon: Settings,
             path: "/settings",
           } as DrawerItemTypes,
         ]
@@ -90,27 +98,30 @@ const getDrawerItems = (
     {
       type: "link",
       title: "GitHub",
-      icon: GitHubIcon,
+      icon: LogoGithub,
       path: "https://github.com/roflcoopter/viseron",
       external: true,
     },
     {
       type: "link",
       title: "Documentation",
-      icon: MenuBookIcon,
+      icon: Book,
       path: "https://viseron.netlify.app",
       external: true,
     },
     {
       type: "link",
       title: "Donations",
-      icon: VolunteerActivismIcon,
+      icon: Need,
       path: "https://github.com/sponsors/roflcoopter",
       external: true,
     },
     { type: "divider" },
   ];
-  return drawerItems;
+
+  const bottomItems: Array<DrawerItemTypes> = [];
+
+  return { topItems, bottomItems };
 };
 
 interface AppDrawerProps {
@@ -119,35 +130,97 @@ interface AppDrawerProps {
 }
 
 function AppDrawerHeader() {
+  const { version } = useContext(ViseronContext);
+
   return (
     <Container
       fixed
       disableGutters
       sx={(theme) => ({
         display: "flex",
+        flexDirection: "column",
         alignItems: "center",
-        justifyContent: "start",
+        justifyContent: "center",
         paddingRight: "10px",
         height: theme.headerHeight,
         borderBottom: `1px solid ${theme.palette.divider}`,
       })}
     >
-      <Box sx={{ margin: "10px" }}>
-        <ViseronLogo width={45} height={45} />
+      <Box sx={{ display: "flex", alignItems: "center" }}>
+        <Box sx={{ marginTop: "5px", marginRight: "6px", marginLeft: "10px" }}>
+          <ViseronLogo width={40} height={40} />
+        </Box>
+        <Box
+          sx={{ display: "flex", alignItems: "baseline", position: "relative" }}
+        >
+          <Typography
+            variant="h5"
+            sx={{
+              fontWeight: "medium",
+              paddingRight: "50px",
+            }}
+          >
+            Viseron
+          </Typography>
+          {version && (
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{
+                fontSize: "0.6rem",
+                position: "absolute",
+                top: 0,
+                left: "87px",
+              }}
+            >
+              {version}
+            </Typography>
+          )}
+        </Box>
       </Box>
-      <Typography
-        variant="h5"
-        sx={{
-          paddingRight: "50px",
-        }}
-      >
-        Viseron
-      </Typography>
     </Container>
   );
 }
 
 function getItem(index: number, location: Location, item: DrawerItemTypes) {
+  const isSelected = (itemPath: string, currentLocation: Location) => {
+    // Handle external URLs (skip selection logic for external links)
+    if (itemPath.startsWith("http://") || itemPath.startsWith("https://")) {
+      return false;
+    }
+
+    // Handle empty or invalid paths
+    if (!itemPath || typeof itemPath !== "string") {
+      return false;
+    }
+
+    try {
+      // Parse the item path to extract pathname and search params
+      const url = new URL(itemPath, "https://example.com");
+      const itemPathname = url.pathname;
+      const itemSearchParams = url.searchParams;
+
+      // Check if pathname matches
+      if (itemPathname !== currentLocation.pathname) {
+        return false;
+      }
+
+      // If there are search params in item path, check if they match current location
+      const currentSearchParams = new URLSearchParams(currentLocation.search);
+      for (const [key, value] of itemSearchParams) {
+        if (currentSearchParams.get(key) !== value) {
+          return false;
+        }
+      }
+
+      return true;
+    } catch (error) {
+      // Handle malformed URLs gracefully
+      console.warn("Invalid URL in drawer item:", itemPath, error);
+      return false;
+    }
+  };
+
   switch (item.type) {
     case "header":
       return (
@@ -165,8 +238,8 @@ function getItem(index: number, location: Location, item: DrawerItemTypes) {
             target="_blank"
             rel="noopener"
           >
-            <ListItemIcon>
-              <item.icon />
+            <ListItemIcon sx={{ minWidth: 40 }}>
+              <item.icon size={23} />
             </ListItemIcon>
             <ListItemText primary={item.title} />
           </ListItemButton>
@@ -177,10 +250,28 @@ function getItem(index: number, location: Location, item: DrawerItemTypes) {
           key={index}
           component={Link}
           to={item.path}
-          selected={item.path === location.pathname}
+          selected={isSelected(item.path, location)}
+          sx={{
+            "&.Mui-selected": {
+              backgroundColor: "action.selected",
+              position: "relative",
+              "&::before": {
+                content: '""',
+                position: "absolute",
+                left: 0,
+                top: 0,
+                bottom: 0,
+                width: "4px",
+                backgroundColor: "primary.main",
+              },
+              "&:hover": {
+                backgroundColor: "action.selected",
+              },
+            },
+          }}
         >
-          <ListItemIcon>
-            <item.icon />
+          <ListItemIcon sx={{ minWidth: 40 }}>
+            <item.icon size={23} />
           </ListItemIcon>
           <ListItemText primary={item.title} />
         </ListItemButton>
@@ -199,7 +290,7 @@ export default function AppDrawer({
   const { auth, user } = useAuthContext();
   const location = useLocation();
 
-  const drawerItems = getDrawerItems(auth, user);
+  const { topItems, bottomItems } = getDrawerItems(auth, user);
 
   return (
     <Drawer
@@ -210,11 +301,31 @@ export default function AppDrawer({
       ModalProps={{
         keepMounted: true,
       }}
+      sx={{
+        "& .MuiDrawer-paper": {
+          borderTop: "none !important",
+          borderBottom: "none !important",
+          borderLeft: "none !important",
+        },
+      }}
     >
       <AppDrawerHeader />
-      <List>
+      <List
+        sx={{
+          display: "flex",
+          flexDirection: "column",
+          height: "100%",
+        }}
+      >
+        <Box onClick={() => setDrawerOpen(false)} sx={{ flexGrow: 1 }}>
+          {topItems.map((item: DrawerItemTypes, index: number) =>
+            getItem(index, location, item),
+          )}
+        </Box>
         <Box onClick={() => setDrawerOpen(false)}>
-          {drawerItems.map((item, index) => getItem(index, location, item))}
+          {bottomItems.map((item: DrawerItemTypes, index: number) =>
+            getItem(index, location, item),
+          )}
         </Box>
       </List>
     </Drawer>

@@ -1,8 +1,11 @@
-import Brightness4Icon from "@mui/icons-material/Brightness4";
-import Brightness7Icon from "@mui/icons-material/Brightness7";
-import LogoutIcon from "@mui/icons-material/Logout";
-import MenuIcon from "@mui/icons-material/Menu";
-import SettingsIcon from "@mui/icons-material/Settings";
+import {
+  Light,
+  Logout,
+  Moon,
+  RightPanelClose,
+  Settings,
+  User,
+} from "@carbon/icons-react";
 import Box from "@mui/material/Box";
 import Container from "@mui/material/Container";
 import IconButton from "@mui/material/IconButton";
@@ -103,6 +106,7 @@ export default function AppHeader() {
             display: "flex",
             alignItems: "center",
             minHeight: theme.headerHeight,
+            paddingX: { xs: 1, md: 2 },
           }}
         >
           <Stack
@@ -110,7 +114,10 @@ export default function AppHeader() {
             spacing={1}
             justifyContent="left"
             alignItems="center"
-            sx={{ width: !mediaQuerySmall ? "12%" : undefined }}
+            sx={{
+              width: !mediaQuerySmall ? "auto" : undefined,
+              flexShrink: 0,
+            }}
           >
             <Tooltip title="Menu" enterDelay={300}>
               <IconButton
@@ -119,7 +126,7 @@ export default function AppHeader() {
                   setDrawerOpen(true);
                 }}
               >
-                <MenuIcon fontSize="small" />
+                <RightPanelClose />
               </IconButton>
             </Tooltip>
             <Tooltip title="Home" enterDelay={300}>
@@ -130,19 +137,20 @@ export default function AppHeader() {
                 sx={{ marginLeft: "16px" }}
               >
                 <ViseronLogo
-                  width={45}
-                  height={45}
+                  width={40}
+                  height={40}
                   style={{ marginTop: "4px" }}
                 />
               </Box>
             </Tooltip>
           </Stack>
           <Box
-            sx={
-              !mediaQuerySmall
-                ? { width: "76%", pointerEvents: "none" }
-                : undefined
-            }
+            sx={{
+              width: mediaQuerySmall ? undefined : "100%",
+              flex: mediaQuerySmall ? 1 : undefined,
+              marginLeft: mediaQuerySmall ? undefined : 1,
+              pointerEvents: mediaQuerySmall ? undefined : "none",
+            }}
           >
             <Breadcrumbs />
           </Box>
@@ -150,7 +158,10 @@ export default function AppHeader() {
             direction="row"
             spacing={1}
             justifyContent="end"
-            sx={{ width: !mediaQuerySmall ? "12%" : { marginLeft: "auto" } }}
+            sx={{
+              width: !mediaQuerySmall ? "auto" : { marginLeft: "auto" },
+              flexShrink: 0,
+            }}
           >
             <Tooltip
               title={
@@ -161,11 +172,7 @@ export default function AppHeader() {
               enterDelay={300}
             >
               <IconButton color="primary" onClick={colorMode.toggleColorMode}>
-                {theme.palette.mode === "dark" ? (
-                  <Brightness7Icon />
-                ) : (
-                  <Brightness4Icon />
-                )}
+                {theme.palette.mode === "dark" ? <Light /> : <Moon />}
               </IconButton>
             </Tooltip>
             {!auth.enabled || (auth.enabled && user?.role) === "admin" ? (
@@ -175,10 +182,21 @@ export default function AppHeader() {
                   color="primary"
                   to="/settings"
                 >
-                  <SettingsIcon />
+                  <Settings />
                 </IconButton>
               </Tooltip>
             ) : null}
+            {auth.enabled && (
+              <Tooltip title="My Profile" enterDelay={300}>
+                <IconButton
+                  component={RouterLink}
+                  color="primary"
+                  to="/profile"
+                >
+                  <User />
+                </IconButton>
+              </Tooltip>
+            )}
             {auth.enabled && (
               <Tooltip title="Logout" enterDelay={300}>
                 <IconButton
@@ -192,7 +210,7 @@ export default function AppHeader() {
                     })
                   }
                 >
-                  <LogoutIcon />
+                  <Logout />
                 </IconButton>
               </Tooltip>
             )}

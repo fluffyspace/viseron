@@ -1,5 +1,5 @@
-import type { Config } from "@docusaurus/types";
 import type * as Preset from "@docusaurus/preset-classic";
+import type { Config } from "@docusaurus/types";
 import { themes } from "prism-react-renderer";
 
 const lightCodeTheme = themes.github;
@@ -14,10 +14,16 @@ const config: Config = {
   url: SITE_URL,
   baseUrl: "/",
   onBrokenLinks: "throw",
-  onBrokenMarkdownLinks: "warn",
   favicon: "img/favicon.ico",
   organizationName: "roflcoopter",
   projectName: PROJECT.toLowerCase(),
+
+  markdown: {
+    mermaid: true,
+    hooks: {
+      onBrokenMarkdownLinks: "warn",
+    },
+  },
 
   presets: [
     [
@@ -49,16 +55,16 @@ const config: Config = {
           label: "Documentation",
         },
         {
-          type: "doc",
-          docId: "contributing",
-          position: "left",
-          label: "Contributing",
-        },
-        {
           title: "Components",
           to: "components-explorer",
           label: "Components",
           position: "left",
+        },
+        {
+          type: "doc",
+          docId: "contributing",
+          position: "left",
+          label: "Contributing",
         },
         {
           type: "doc",
@@ -67,9 +73,23 @@ const config: Config = {
           label: "Developers",
         },
         {
+          href: "https://hub.docker.com/r/roflcoopter/viseron/tags",
+          label: "Docker Hub",
+          position: "right",
+        },
+        {
           href: "https://github.com/roflcoopter/viseron",
           label: "GitHub",
           position: "right",
+        },
+        {
+          type: "html",
+          position: "right",
+          value: `
+            <span class="docker-pull-count">
+              <img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/roflcoopter/viseron?color=blue">
+            </span>
+          `,
         },
       ],
     },
@@ -143,6 +163,7 @@ const config: Config = {
     },
   } satisfies Preset.ThemeConfig,
   themes: [
+    "@docusaurus/theme-mermaid",
     [
       require.resolve("@easyops-cn/docusaurus-search-local"),
       {
@@ -155,6 +176,7 @@ const config: Config = {
     ],
   ],
   plugins: ["@docusaurus/plugin-ideal-image"],
+  clientModules: [require.resolve("./src/lib/injectVersion.ts")],
 };
 
 export default config;

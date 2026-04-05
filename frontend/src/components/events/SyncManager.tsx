@@ -1,3 +1,4 @@
+import { Dayjs } from "dayjs";
 import Hls from "hls.js";
 import { useCallback, useEffect } from "react";
 import { useShallow } from "zustand/react/shallow";
@@ -13,7 +14,8 @@ import {
   useReferencePlayerStore,
 } from "components/events/utils";
 import useControlledInterval from "hooks/UseControlledInterval";
-import { dateToTimestamp, dateToTimestampMillis, sleep } from "lib/helpers";
+import { sleep } from "lib/helpers";
+import { getDayjsFromDate } from "lib/helpers/dates";
 
 const SYNC_INTERVAL = 100; // Sync interval in milliseconds
 const MAX_DRIFT = 0.5; // Maximum allowed drift in seconds
@@ -49,8 +51,8 @@ function SyncManager({ children }: SyncManagerProps) {
       playingDateRef: state.playingDateRef,
     })),
   );
-  const seekSafely = useCallback((player: Hls, referenceDate: Date) => {
-    if (!player.levels || player.levels.length === 0) {
+  const seekSafely = useCallback((player: Hls, referenceDate: Dayjs) => {
+    if (!player.levels || player.levels.length === 0 || !player.media) {
       return false;
     }
 
@@ -64,24 +66,24 @@ function SyncManager({ children }: SyncManagerProps) {
       return false;
     }
 
-    const referenceTimestamp = dateToTimestampMillis(referenceDate);
+    const referenceTimestampMillis = referenceDate.valueOf();
     const targetFragment = findFragmentByTimestamp(
       fragments,
-      referenceTimestamp,
+      referenceTimestampMillis,
     );
     if (!targetFragment) {
       return false;
     }
-    const seekTarget = getSeekTarget(targetFragment, referenceTimestamp);
+    const seekTarget = getSeekTarget(targetFragment, referenceTimestampMillis);
 
-    const seekable = player.media!.seekable;
+    const seekable = player.media.seekable;
     if (seekable.length === 0) {
       return false;
     }
 
     for (let i = 0; i < seekable.length; i++) {
       if (seekTarget >= seekable.start(i) && seekTarget <= seekable.end(i)) {
-        player.media!.currentTime = seekTarget;
+        player.media.currentTime = seekTarget;
         return true;
       }
     }
@@ -96,12 +98,16 @@ function SyncManager({ children }: SyncManagerProps) {
 
     const playersWithTime = hlsRefs.filter(
       (player): player is React.MutableRefObject<Hls> =>
-        player.current !== null && player.current.playingDate !== null,
+        player.current !== null &&
+        player.current.playingDate !== null &&
+        player.current.media !== null,
     );
 
     // Sync mute state
     playersWithTime.forEach((player) => {
-      player.current.media!.muted = isMuted;
+      if (player.current.media) {
+        player.current.media.muted = isMuted;
+      }
     });
 
     if (!isPlaying) {
@@ -113,9 +119,9 @@ function SyncManager({ children }: SyncManagerProps) {
       playersWithTime.reduce<React.MutableRefObject<Hls> | null>(
         (prev, current) => {
           if (prev === null) {
-            return !current.current.media!.paused ? current : null;
+            return !current.current.media?.paused ? current : null;
           }
-          return !current.current.media!.paused &&
+          return !current.current.media?.paused &&
             current.current.playingDate! > prev.current.playingDate!
             ? current
             : prev;
@@ -129,23 +135,23 @@ function SyncManager({ children }: SyncManagerProps) {
       setIsLive(referencePlayer.current.latency < LIVE_EDGE_DELAY * 1.5);
       setIsPlaying(true);
       playingDateRef.current = referencePlayer.current.playingDate
-        ? dateToTimestamp(referencePlayer.current.playingDate)
+        ? getDayjsFromDate(referencePlayer.current.playingDate).unix()
         : requestedTimestamp;
       playersWithTime.forEach((player) => {
         if (player !== referencePlayer) {
           const timeDiff =
-            (dateToTimestampMillis(referencePlayer.current.playingDate!) -
-              dateToTimestampMillis(player.current.playingDate!)) /
+            (getDayjsFromDate(referencePlayer.current.playingDate!).valueOf() -
+              getDayjsFromDate(player.current.playingDate!).valueOf()) /
             1000;
 
           if (Math.abs(timeDiff) > MAX_DRIFT) {
             const seeked = seekSafely(
               player.current,
-              referencePlayer.current.playingDate!,
+              getDayjsFromDate(referencePlayer.current.playingDate!),
             );
-            if (seeked) {
-              player.current
-                .media!.play()
+            if (seeked && player.current.media) {
+              player.current.media
+                .play()
                 .then(() => {
                   setHlsRefsError(player, null);
                 })
@@ -167,15 +173,26 @@ function SyncManager({ children }: SyncManagerProps) {
 
     // If there are no players with time, play the first player
     if (playersWithTime.length === 0) {
-      if (hlsRefs.length > 0 && hlsRefs[0].current) {
-        hlsRefs[0].current.media!.play().then(() => {
-          setHlsRefsError(hlsRefs[0], null);
-        });
+      if (
+        hlsRefs.length > 0 &&
+        hlsRefs[0].current &&
+        hlsRefs[0].current.media
+      ) {
+        hlsRefs[0].current.media
+          .play()
+          .then(() => {
+            setHlsRefsError(hlsRefs[0], null);
+          })
+          .catch(() => {
+            // Ignore play errors
+          });
       }
     }
 
     // Check if all players are paused
-    if (playersWithTime.every((player) => player.current.media!.paused)) {
+    if (
+      playersWithTime.every((player) => player.current.media?.paused ?? true)
+    ) {
       const playingDateMillis = playingDateRef.current * 1000;
 
       let playerToPlayIndex = -1;
@@ -218,17 +235,23 @@ function SyncManager({ children }: SyncManagerProps) {
           fragments,
           playingDateMillis,
         );
-        if (closestFragment && closestFragment.programDateTime) {
-          playerToPlay.current.media!.currentTime = closestFragment.start;
+        if (
+          closestFragment &&
+          closestFragment.programDateTime &&
+          playerToPlay.current.media
+        ) {
+          playerToPlay.current.media.currentTime = closestFragment.start;
         }
-        playerToPlay.current
-          .media!.play()
-          .then(() => {
-            setHlsRefsError(playerToPlay, null);
-          })
-          .catch(() => {
-            // Ignore play errors
-          });
+        if (playerToPlay.current.media) {
+          playerToPlay.current.media
+            .play()
+            .then(() => {
+              setHlsRefsError(playerToPlay, null);
+            })
+            .catch(() => {
+              // Ignore play errors
+            });
+        }
       }
     }
   }, [
@@ -251,14 +274,17 @@ function SyncManager({ children }: SyncManagerProps) {
       if (player.current) {
         player.current.on(Hls.Events.ERROR, (_event, data) => {
           // Dont pause if this is the only playing player
-          console.warn("SyncManager: Error event", data);
+          // console.warn("SyncManager: Error event", data);
           if (
-            hlsRefs.filter((p) => p.current && !p.current.media!.paused)
-              .length === 1
+            hlsRefs.filter(
+              (p) => p.current && p.current.media && !p.current.media.paused,
+            ).length === 1
           ) {
-            player.current!.media!.play().catch(() => {
-              // Ignore play errors
-            });
+            if (player.current!.media) {
+              player.current!.media.play().catch(() => {
+                // Ignore play errors
+              });
+            }
             return;
           }
 
@@ -268,13 +294,17 @@ function SyncManager({ children }: SyncManagerProps) {
             data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR ||
             data.details === Hls.ErrorDetails.LEVEL_PARSING_ERROR
           ) {
-            player.current!.media!.play().catch(() => {
-              // Ignore play errors
-            });
+            if (player.current!.media) {
+              player.current!.media.play().catch(() => {
+                // Ignore play errors
+              });
+            }
             return;
           }
 
-          player.current!.media!.pause();
+          if (player.current!.media) {
+            player.current!.media.pause();
+          }
         });
       }
     });

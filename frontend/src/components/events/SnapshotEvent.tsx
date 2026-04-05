@@ -1,5 +1,5 @@
+import { Download } from "@carbon/icons-react";
 import Image from "@jy95/material-ui-image";
-import FileDownloadIcon from "@mui/icons-material/FileDownload";
 import Box from "@mui/material/Box";
 import Card from "@mui/material/Card";
 import CardActionArea from "@mui/material/CardActionArea";
@@ -19,7 +19,6 @@ import HoverPopover from "material-ui-popup-state/HoverPopover";
 import { memo, useCallback, useMemo, useRef } from "react";
 
 import { CameraNameOverlay } from "components/camera/CameraNameOverlay";
-import { useScrollingStore } from "components/events/timeline/VirtualList";
 import {
   EVENT_ICON_HEIGHT,
   TICK_HEIGHT,
@@ -31,15 +30,21 @@ import {
   getIcon,
   getSrc,
   useFilterStore,
+  useScrollingStore,
   useSelectEvent,
 } from "components/events/utils";
+import { ImageWithFallback } from "components/images/ImageWithFallback";
 import { useFirstRender } from "hooks/UseFirstRender";
 import { useExportEvent } from "lib/commands";
 import { BLANK_IMAGE, isTouchDevice, toTitleCase } from "lib/helpers";
+import {
+  getDayjsFromDateTimeString,
+  getTimeStringFromDayjs,
+} from "lib/helpers/dates";
 import * as types from "lib/types";
 
 const getText = (event: types.CameraEvent) => {
-  const date = new Date(getEventTime(event));
+  const date = getDayjsFromDateTimeString(getEventTime(event));
   switch (event.type) {
     case "object":
       return (
@@ -50,7 +55,7 @@ const getText = (event: types.CameraEvent) => {
 
           <Box>{`Label: ${event.label}`}</Box>
           <Box>{`Confidence: ${convertToPercentage(event.confidence)}%`}</Box>
-          <Box>{`Time: ${date.toLocaleTimeString()}`}</Box>
+          <Box>{`Time: ${getTimeStringFromDayjs(date)}`}</Box>
         </Box>
       );
 
@@ -64,7 +69,7 @@ const getText = (event: types.CameraEvent) => {
           <Box>{`Confidence: ${convertToPercentage(
             event.data.confidence,
           )}%`}</Box>
-          <Box>{`Time: ${date.toLocaleTimeString()}`}</Box>
+          <Box>{`Time: ${getTimeStringFromDayjs(date)}`}</Box>
         </Box>
       );
 
@@ -79,7 +84,7 @@ const getText = (event: types.CameraEvent) => {
             event.data.confidence,
           )}%`}</Box>
           <Box>{`Known: ${event.data.known}`}</Box>
-          <Box>{`Time: ${date.toLocaleTimeString()}`}</Box>
+          <Box>{`Time: ${getTimeStringFromDayjs(date)}`}</Box>
         </Box>
       );
 
@@ -92,7 +97,7 @@ const getText = (event: types.CameraEvent) => {
           {event.duration ? (
             <Box>{`Duration: ${Math.round(event.duration)}s`}</Box>
           ) : null}
-          <Box>{`Time: ${date.toLocaleTimeString()}`}</Box>
+          <Box>{`Time: ${getTimeStringFromDayjs(date)}`}</Box>
         </Box>
       );
 
@@ -108,7 +113,7 @@ const getText = (event: types.CameraEvent) => {
           {event.duration ? (
             <Box>{`Duration: ${Math.round(event.duration)}s`}</Box>
           ) : null}
-          <Box>{`Time: ${date.toLocaleTimeString()}`}</Box>
+          <Box>{`Time: ${getTimeStringFromDayjs(date)}`}</Box>
         </Box>
       );
 
@@ -195,7 +200,7 @@ function PopoverContent({ events }: { events: types.CameraEvent[] }) {
                         e.preventDefault();
                       }}
                     >
-                      <FileDownloadIcon />
+                      <Download size={20} />
                     </IconButton>
                   </Tooltip>
                 </Stack>
@@ -380,9 +385,12 @@ function Snapshot({ snapshotPath }: { snapshotPath: string }) {
           border: `1px solid ${theme.palette.primary[900]}`,
         }),
         lineHeight: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
       })}
     >
-      <img
+      <ImageWithFallback
         src={snapshotPath}
         alt="Event snapshot"
         style={{
@@ -393,6 +401,7 @@ function Snapshot({ snapshotPath }: { snapshotPath: string }) {
           objectFit: "contain",
           background: theme.palette.background.default,
         }}
+        fallbackSize={32}
       />
     </Box>
   );

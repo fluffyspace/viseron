@@ -1,7 +1,5 @@
-import CalendarMonthIcon from "@mui/icons-material/CalendarMonth";
+import { CalendarHeatMap, Download, VideoAdd } from "@carbon/icons-react";
 import FactCheckIcon from "@mui/icons-material/FactCheck";
-import FileDownloadIcon from "@mui/icons-material/FileDownload";
-import VideocamIcon from "@mui/icons-material/Videocam";
 import Box from "@mui/material/Box";
 import Fab from "@mui/material/Fab";
 import Tooltip from "@mui/material/Tooltip";
@@ -14,8 +12,8 @@ import { ExportDialog } from "components/events/ExportDialog";
 import { UseForTestDialog } from "components/tests/UseForTestDialog";
 
 type FloatingMenuProps = {
-  date: Dayjs | null;
-  setDate: (date: Dayjs | null) => void;
+  date: Dayjs;
+  setDate: (date: Dayjs) => void;
 };
 
 export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
@@ -36,7 +34,9 @@ export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
         date={date}
         onChange={(value) => {
           setDateDialogOpen(false);
-          setDate(value);
+          if (value) {
+            setDate(value);
+          }
         }}
       />
       <ExportDialog open={exportDialogOpen} setOpen={setExportDialogOpen} />
@@ -44,14 +44,15 @@ export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
         open={testDialogOpen}
         setOpen={setTestDialogOpen}
       />
-      <Box sx={{ position: "absolute", bottom: 14, right: 24 }}>
+      <Box sx={{ position: "absolute", bottom: 16, right: 24 }}>
+
         <Tooltip title="Select Cameras">
           <Fab
             size="small"
             color="primary"
             onClick={() => setCameraDialogOpen(true)}
           >
-            <VideocamIcon />
+            <VideoAdd size={20} />
           </Fab>
         </Tooltip>
         <Tooltip title="Select Date">
@@ -61,7 +62,7 @@ export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
             sx={{ marginLeft: 1 }}
             onClick={() => setDateDialogOpen(true)}
           >
-            <CalendarMonthIcon />
+            <CalendarHeatMap size={20} />
           </Fab>
         </Tooltip>
         <Tooltip title="Download">
@@ -71,7 +72,7 @@ export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
             sx={{ marginLeft: 1 }}
             onClick={() => setExportDialogOpen(true)}
           >
-            <FileDownloadIcon />
+            <Download size={20} />
           </Fab>
         </Tooltip>
         <Tooltip title="Use for test">

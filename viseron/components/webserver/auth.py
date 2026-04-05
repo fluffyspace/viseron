@@ -1,4 +1,5 @@
 """Authentication."""
+
 from __future__ import annotations
 
 import base64
@@ -13,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, cast
+from zoneinfo import available_timezones
 
 import bcrypt
 import jwt
@@ -46,7 +48,7 @@ class InvalidRoleError(ViseronError):
     """Invalid role specified."""
 
 
-class AuthenticationFailed(ViseronError):
+class AuthenticationFailedError(ViseronError):
     """Authentication failed."""
 
 
@@ -56,6 +58,33 @@ class UserDoesNotExistError(ViseronError):
 
 class LastAdminUserError(ViseronError):
     """Cannot delete the last admin user."""
+
+
+class InvalidTimezoneError(ViseronError):
+    """Invalid timezone specified."""
+
+
+class InvalidDateFormatError(ViseronError):
+    """Invalid date format specified."""
+
+
+class InvalidTimeFormatError(ViseronError):
+    """Invalid time format specified."""
+
+
+VALID_DATE_FORMATS = [
+    "YYYY-MM-DD",
+    "MM/DD/YYYY",
+    "DD/MM/YYYY",
+    "DD.MM.YYYY",
+    "MM-DD-YYYY",
+    "DD-MM-YYYY",
+]
+
+VALID_TIME_FORMATS = [
+    "12h",
+    "24h",
+]
 
 
 @dataclass
@@ -88,6 +117,23 @@ class Role(enum.Enum):
 
 
 @dataclass
+class Preferences:
+    """User preferences."""
+
+    timezone: str | None = None
+    date_format: str | None = None
+    time_format: str | None = None
+
+    def asdict(self) -> dict[str, Any]:
+        """Convert preferences to dict."""
+        return {
+            "timezone": self.timezone,
+            "date_format": self.date_format,
+            "time_format": self.time_format,
+        }
+
+
+@dataclass
 class User:
     """User."""
 
@@ -98,6 +144,7 @@ class User:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     enabled: bool = True
     assigned_cameras: list[str] | None = None
+    preferences: Preferences | None = None
 
     def asdict(self) -> dict[str, Any]:
         """Convert user to dict."""
@@ -107,6 +154,7 @@ class User:
             "username": self.username,
             "role": self.role.value,
             "assigned_cameras": self.assigned_cameras,
+            "preferences": self.preferences,
         }
 
 
@@ -150,7 +198,7 @@ def token_response(
 class Auth:
     """Users."""
 
-    def __init__(self, vis: Viseron, config) -> None:
+    def __init__(self, vis: Viseron, config: dict[str, Any]) -> None:
         self._vis = vis
         self._config = config
         self._users: dict[str, User] | None = None
@@ -166,7 +214,7 @@ class Auth:
             if self._users is None:
                 LOGGER.debug("Loading users")
                 self._load()
-                assert self._users is not None
+                assert self._users is not None  # noqa: S101
         return self._users
 
     @property
@@ -176,7 +224,7 @@ class Auth:
             if self._refresh_tokens is None:
                 LOGGER.debug("Loading refresh tokens")
                 self._load()
-                assert self._refresh_tokens is not None
+                assert self._refresh_tokens is not None  # noqa: S101
         return self._refresh_tokens
 
     @property
@@ -203,9 +251,7 @@ class Auth:
 
     def onboarding_complete(self) -> bool:
         """Return onboarding status."""
-        if self.users or os.path.exists(self.onboarding_path()):
-            return True
-        return False
+        return bool(self.users or os.path.exists(self.onboarding_path()))
 
     @staticmethod
     def hash_password(password: str) -> str:
@@ -220,8 +266,9 @@ class Auth:
         username: str,
         password: str,
         role: Role,
+        *,
         enabled: bool = True,
-    ):
+    ) -> User:
         """Add user."""
         LOGGER.debug(f"Adding user {username}")
         name = name.strip()
@@ -249,18 +296,14 @@ class Auth:
         name: str,
         username: str,
         password: str,
-    ):
+    ) -> User:
         """Onboard the first user."""
         user = self.add_user(name, username, password, Role.ADMIN)
         Path(self.onboarding_path()).touch()
         return user
 
     def validate_user(self, username: str, password: str) -> User:
-        """Validate username and password.
-
-        Raises:
-            AuthenticationFailed: If authentication failed
-        """
+        """Validate username and password."""
         username = username.strip().casefold()
         fakepw_hash = b"$2b$12$JkLmYgiPenMkcym29yHqReoa1dkONXqy6S2OBoU6FmjLShqDn/OuS"
         user = None
@@ -272,12 +315,12 @@ class Auth:
 
         if user:
             if not bcrypt.checkpw(password.encode(), base64.b64decode(user.password)):
-                raise AuthenticationFailed
+                raise AuthenticationFailedError
             return user
 
         # Always check a fake password to avoid timing attacks.
         bcrypt.checkpw(b"fakepw", fakepw_hash)
-        raise AuthenticationFailed
+        raise AuthenticationFailedError
 
     def get_user(self, user_id: str) -> User | None:
         """Get user by id."""
@@ -337,9 +380,11 @@ class Auth:
             user = self.users[user_id]
 
             # Check if the new username is already taken by another user
-            if username.strip().casefold() != user.username:
-                if self.get_user_by_username(username.strip().casefold()):
-                    raise UserExistsError(f"Username {username} is already taken")
+            if (
+                username.strip().casefold() != user.username
+                and self.get_user_by_username(username.strip().casefold())
+            ):
+                raise UserExistsError(f"Username {username} is already taken")
 
             # Prevent role change of the last admin user
             if user.role == Role.ADMIN and role != Role.ADMIN:
@@ -361,6 +406,54 @@ class Auth:
             LOGGER.debug(f"Updated user {user.username}")
             self.save()
 
+    def update_display_name(self, user_id: str, name: str) -> None:
+        """Update the display name for a user."""
+        trimmed_name = name.strip()
+        if not trimmed_name:
+            raise ValueError("Display name cannot be empty")
+
+        with self._user_lock:
+            if user_id not in self.users:
+                raise UserDoesNotExistError(f"User with ID {user_id} does not exist")
+
+            user = self.users[user_id]
+            user.name = trimmed_name
+            LOGGER.debug(f"Updated display name for user {user.username}")
+            self.save()
+
+    def update_preferences(
+        self,
+        user_id: str,
+        preferences: Preferences,
+    ) -> None:
+        """Update user preferences."""
+        with self._user_lock:
+            if user_id not in self.users:
+                raise UserDoesNotExistError(f"User with ID {user_id} does not exist")
+
+            user = self.users[user_id]
+
+            # Validate timezone if provided
+            timezone = preferences.timezone
+            if timezone is not None and timezone not in available_timezones():
+                raise InvalidTimezoneError(f"Invalid timezone: {timezone}")
+
+            # Validate date_format if provided
+            date_format = preferences.date_format
+            if date_format is not None and date_format not in VALID_DATE_FORMATS:
+                raise InvalidDateFormatError(f"Invalid date format: {date_format}")
+
+            # Validate time_format if provided
+            time_format = preferences.time_format
+            if time_format is not None and time_format not in VALID_TIME_FORMATS:
+                raise InvalidTimeFormatError(f"Invalid time format: {time_format}")
+
+            # Update preferences
+            user.preferences = preferences
+
+            LOGGER.debug(f"Updated preferences for user {user.username}")
+            self.save()
+
     def _load(self) -> None:
         """Load users from storage."""
         LOGGER.debug("Loading data from auth store")
@@ -370,6 +463,10 @@ class Auth:
         refresh_tokens: dict[str, RefreshToken] = {}
 
         for user in data.get("users", {}).values():
+            preferences: Preferences | None = None
+            if preferences_dict := user.get("preferences", None):
+                preferences = Preferences(**preferences_dict)
+
             users[user["id"]] = User(
                 name=user["name"],
                 username=user["username"],
@@ -379,6 +476,7 @@ class Auth:
                 id=user["id"],
                 enabled=user["enabled"],
                 assigned_cameras=user.get("assigned_cameras", None),
+                preferences=preferences,
             )
 
         for refresh_token in data.get("refresh_tokens", {}).values():
@@ -416,16 +514,12 @@ class Auth:
         client_id: str,
         access_token_type: Literal["normal"],
         access_token_expiration: datetime.timedelta = ACCESS_TOKEN_EXPIRATION,
-    ):
+    ) -> RefreshToken:
         """Generate refresh token."""
         refresh_token = RefreshToken(
             user_id=user_id,
             client_id=client_id,
-            session_expiration=(
-                self.session_expiry
-                if self.session_expiry
-                else datetime.timedelta(days=3650)
-            ),
+            session_expiration=(self.session_expiry or datetime.timedelta(days=3650)),
             access_token_type=access_token_type,
             access_token_expiration=access_token_expiration,
         )
@@ -459,9 +553,9 @@ class Auth:
     def generate_access_token(
         self,
         refresh_token: RefreshToken,
-        remote_ip,
+        remote_ip: str,
         expiry: datetime.timedelta | None = None,
-    ):
+    ) -> str:
         """Generate access token using JWT."""
         self.validate_refresh_token(refresh_token)
         now = utcnow()
@@ -480,7 +574,7 @@ class Auth:
             algorithm="HS256",
         )
 
-    def validate_access_token(self, access_token: str):
+    def validate_access_token(self, access_token: str) -> None | RefreshToken:
         """Validate access token."""
         try:
             unverif_claims = jwt.decode(
@@ -489,7 +583,7 @@ class Auth:
         except jwt.InvalidTokenError:
             return None
 
-        refresh_token = self.get_refresh_token(cast(str, unverif_claims.get("iss")))
+        refresh_token = self.get_refresh_token(cast("str", unverif_claims.get("iss")))
         if refresh_token is None:
             jwt_key = ""
             issuer = ""
