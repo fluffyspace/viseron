@@ -113,6 +113,8 @@ interface MjpegPlayerProps extends React.HTMLAttributes<HTMLElement> {
   drawZones?: boolean;
   drawPostProcessorMask?: boolean;
   isMenuOpen?: boolean;
+  overlay?: React.ReactNode;
+  containerRefCallback?: (ref: React.RefObject<HTMLDivElement | null>) => void;
 }
 
 export function MjpegPlayer({
@@ -127,6 +129,8 @@ export function MjpegPlayer({
   drawZones = false,
   drawPostProcessorMask = false,
   isMenuOpen = false,
+  overlay,
+  containerRefCallback,
 }: MjpegPlayerProps) {
   const theme = useTheme();
   const imgRef = useRef<HTMLImageElement>(null);
@@ -143,6 +147,12 @@ export function MjpegPlayer({
   } = useMjpegControlsVisibility(containerRef);
 
   const error = useMjpegErrorHandling(imgRef, src);
+
+  useEffect(() => {
+    if (containerRefCallback) {
+      containerRefCallback(containerRef);
+    }
+  }, [containerRefCallback, containerRef]);
 
   return (
     <div
@@ -189,6 +199,7 @@ export function MjpegPlayer({
         }}
         draggable={false}
       />
+      {overlay}
       <CameraNameOverlay
         camera_identifier={camera.identifier}
         extraStatusText={error || "MJPEG Stream"}

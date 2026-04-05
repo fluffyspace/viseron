@@ -173,6 +173,8 @@ interface LivePlayerProps extends React.HTMLAttributes<HTMLElement> {
   playerRef?: React.RefObject<VideoRTC | null>;
   extraButtons?: React.ReactNode;
   isMenuOpen?: boolean;
+  overlay?: React.ReactNode;
+  containerRefCallback?: (ref: React.RefObject<HTMLDivElement | null>) => void;
 }
 
 export function LivePlayer({
@@ -183,12 +185,20 @@ export function LivePlayer({
   playerRef,
   extraButtons,
   isMenuOpen = false,
+  overlay,
+  containerRefCallback,
 }: LivePlayerProps) {
   const _elementRef = useRef<VideoRTC>(null);
   const elementRef = playerRef || _elementRef;
   const containerRef = useRef<HTMLDivElement>(null);
 
   const playerStatus = usePlayerStatus(elementRef);
+
+  useEffect(() => {
+    if (containerRefCallback) {
+      containerRefCallback(containerRef);
+    }
+  }, [containerRefCallback, containerRef]);
 
   const {
     handlePlayPause,
@@ -232,6 +242,7 @@ export function LivePlayer({
         extraButtons={extraButtons}
       />
       <video-stream ref={elementRef} style={style} controls={controlsVisible} />
+      {overlay}
       <CameraNameOverlay
         camera_identifier={camera.identifier}
         extraStatusText={playerStatus}
