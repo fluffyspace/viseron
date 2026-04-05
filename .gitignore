@@ -130,5 +130,7 @@
 !/README.md
 !tox.ini
 !/config
+# Test runner video fixtures live under /config/test_videos/<camera>/{motion,object}/{positive,negative}/
+# and are intentionally not committed (can be large binaries).
 
 *__pycache*

@@ -412,6 +412,7 @@ class AbstractObjectDetector(AbstractDomain):
                 y2=obj.rel_y2,
                 snapshot_path=snapshot_path,
                 zone=zone,
+                test=self._camera.is_test_camera,
             )
             session.execute(stmt)
             session.commit()

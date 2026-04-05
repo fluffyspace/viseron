@@ -104,6 +104,7 @@ class EventsAPIHandler(BaseAPIHandler):
                 .where(Motion.camera_identifier == camera.identifier)
                 .where(Motion.start_time >= time_from_datetime)
                 .where(Motion.start_time <= time_to_datetime)
+                .where(Motion.test.is_(False))
             ).order_by(Motion.start_time.desc())
             motion = session.execute(stmt).scalars().all()
         motion_events = []
@@ -153,6 +154,7 @@ class EventsAPIHandler(BaseAPIHandler):
                 select(Objects)
                 .where(Objects.camera_identifier == camera.identifier)
                 .where(Objects.created_at.between(time_from_datetime, time_to_datetime))
+                .where(Objects.test.is_(False))
             ).order_by(Objects.created_at.desc())
             objects = session.execute(stmt).scalars().all()
         object_events = []
@@ -196,6 +198,7 @@ class EventsAPIHandler(BaseAPIHandler):
                 .where(Recordings.camera_identifier == camera.identifier)
                 .where(Recordings.start_time >= time_from_datetime)
                 .where(Recordings.start_time <= time_to_datetime)
+                .where(Recordings.test.is_(False))
             ).order_by(Recordings.start_time.desc())
             recordings = session.execute(stmt).scalars().all()
         recording_events = []
@@ -362,6 +365,7 @@ class EventsAPIHandler(BaseAPIHandler):
                     func.count(),  # pylint: disable=not-callable
                 )
                 .where(Motion.camera_identifier.in_(camera_identifiers))
+                .where(Motion.test.is_(False))
                 .group_by(func.date(Motion.start_time + self.utc_offset))
             )
             motion_events = session.execute(stmt).all()
@@ -372,6 +376,7 @@ class EventsAPIHandler(BaseAPIHandler):
                     func.count(),  # pylint: disable=not-callable
                 )
                 .where(Recordings.camera_identifier.in_(camera_identifiers))
+                .where(Recordings.test.is_(False))
                 .group_by(func.date(Recordings.start_time + self.utc_offset))
             )
             recording_events = session.execute(stmt).all()
@@ -382,6 +387,7 @@ class EventsAPIHandler(BaseAPIHandler):
                     func.count(),  # pylint: disable=not-callable
                 )
                 .where(Objects.camera_identifier.in_(camera_identifiers))
+                .where(Objects.test.is_(False))
                 .group_by(func.date(Objects.created_at + self.utc_offset))
             )
             object_events = session.execute(stmt).all()

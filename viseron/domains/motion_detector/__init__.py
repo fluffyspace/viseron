@@ -217,6 +217,7 @@ class AbstractMotionDetector(AbstractDomain):
                     start_time=utcnow(),
                     end_time=None,
                     snapshot_path=snapshot_path,
+                    test=self._camera.is_test_camera,
                 )
                 .returning(Motion.id)
             )

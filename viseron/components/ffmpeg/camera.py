@@ -39,6 +39,7 @@ from .const import (
     CONFIG_FFMPEG_LOGLEVEL,
     CONFIG_FFMPEG_RECOVERABLE_ERRORS,
     CONFIG_FFPROBE_LOGLEVEL,
+    CONFIG_FILE_SOURCE,
     CONFIG_FPS,
     CONFIG_FRAME_TIMEOUT,
     CONFIG_GLOBAL_ARGS,
@@ -64,6 +65,7 @@ from .const import (
     CONFIG_SEGMENTS_FOLDER,
     CONFIG_STREAM_FORMAT,
     CONFIG_SUBSTREAM,
+    CONFIG_TEST_MODE,
     CONFIG_USERNAME,
     CONFIG_VIDEO_FILTERS,
     CONFIG_WIDTH,
@@ -72,6 +74,7 @@ from .const import (
     DEFAULT_FFMPEG_LOGLEVEL,
     DEFAULT_FFMPEG_RECOVERABLE_ERRORS,
     DEFAULT_FFPROBE_LOGLEVEL,
+    DEFAULT_FILE_SOURCE,
     DEFAULT_FPS,
     DEFAULT_FRAME_TIMEOUT,
     DEFAULT_GLOBAL_ARGS,
@@ -92,6 +95,7 @@ from .const import (
     DEFAULT_RTSP_TRANSPORT,
     DEFAULT_STREAM_FORMAT,
     DEFAULT_SUBSTREAM,
+    DEFAULT_TEST_MODE,
     DEFAULT_USERNAME,
     DEFAULT_VIDEO_FILTERS,
     DEFAULT_WIDTH,
@@ -100,6 +104,7 @@ from .const import (
     DESC_FFMPEG_LOGLEVEL,
     DESC_FFMPEG_RECOVERABLE_ERRORS,
     DESC_FFPROBE_LOGLEVEL,
+    DESC_FILE_SOURCE,
     DESC_FPS,
     DESC_FRAME_TIMEOUT,
     DESC_GLOBAL_ARGS,
@@ -126,6 +131,7 @@ from .const import (
     DESC_SEGMENTS_FOLDER,
     DESC_STREAM_FORMAT,
     DESC_SUBSTREAM,
+    DESC_TEST_MODE,
     DESC_USERNAME,
     DESC_VIDEO_FILTERS,
     DESC_WIDTH,
@@ -154,6 +160,11 @@ def get_default_hwaccel_args() -> list[str]:
 
 
 STREAM_SCEHMA_DICT = {
+    vol.Optional(
+        CONFIG_FILE_SOURCE,
+        default=DEFAULT_FILE_SOURCE,
+        description=DESC_FILE_SOURCE,
+    ): Maybe(vol.All(str, vol.Length(min=1))),
     vol.Required(CONFIG_PATH, description=DESC_PATH): vol.All(str, vol.Length(min=1)),
     vol.Required(CONFIG_PORT, description=DESC_PORT): vol.All(int, vol.Range(min=1)),
     vol.Optional(
@@ -297,6 +308,11 @@ CAMERA_SCHEMA = CAMERA_SCHEMA.extend(
             CONFIG_RECORD_ONLY,
             default=DEFAULT_RECORD_ONLY,
             description=DESC_RECORD_ONLY,
+        ): bool,
+        vol.Optional(
+            CONFIG_TEST_MODE,
+            default=DEFAULT_TEST_MODE,
+            description=DESC_TEST_MODE,
         ): bool,
     }
 )
@@ -611,3 +627,8 @@ class Camera(AbstractCamera):
     def is_recording(self):
         """Return recording status."""
         return self._recorder.is_recording
+
+    @property
+    def is_test_camera(self) -> bool:
+        """Return True if this camera is a test-runner camera."""
+        return bool(self._config.get(CONFIG_TEST_MODE, False))

@@ -403,3 +403,87 @@ export type DownloadFileResponse = {
 export type SystemDispatchedEvents = {
   events: string[];
 };
+
+export type TestRunSummary = {
+  id: number;
+  started_at: string | null;
+  started_timestamp: number | null;
+  finished_at: string | null;
+  finished_timestamp: number | null;
+  total: number;
+  passed: number;
+  failed: number;
+  status: "running" | "complete" | "error" | string;
+};
+
+export type TestCaseResult = {
+  id: number;
+  run_id: number;
+  case_name: string;
+  camera_identifier: string;
+  kind: "motion" | "object" | string;
+  expected: Record<string, unknown>;
+  actual: Record<string, unknown>;
+  passed: boolean;
+  video_path: string | null;
+  snapshot_path: string | null;
+  message: string | null;
+  created_at: string | null;
+  created_timestamp: number | null;
+};
+
+export type TestRunDetail = TestRunSummary & {
+  results: TestCaseResult[];
+};
+
+export type TestRunsListResponse = {
+  runs: TestRunSummary[];
+};
+
+export type TestRunDetailResponse = {
+  run: TestRunDetail | null;
+};
+
+export type TestRunStartResponse = {
+  started: boolean;
+  is_running: boolean;
+  completion_pending: boolean;
+};
+
+export type TestClipCreateRequest = {
+  camera_identifier: string;
+  start: number;
+  end: number;
+  name: string;
+  kind: "motion" | "object";
+  polarity: "positive" | "negative";
+  expected: Record<string, unknown>;
+  duration?: number;
+};
+
+export type TestClipCreateResponse = {
+  case_id: number;
+  clip_path: string;
+  slug: string;
+  snippet: string;
+  duration: number;
+};
+
+export type TestCase = {
+  id: number;
+  name: string;
+  slug: string;
+  camera_identifier: string;
+  kind: "motion" | "object" | string;
+  polarity: "positive" | "negative" | string;
+  expected: Record<string, unknown>;
+  video_path: string;
+  duration: number;
+  created_at: string | null;
+  snippet: string;
+  pending_restart: boolean;
+};
+
+export type TestCasesListResponse = {
+  cases: TestCase[];
+};

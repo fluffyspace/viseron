@@ -9,14 +9,17 @@ from enum import Enum
 from typing import Literal
 
 from sqlalchemy import (
+    Boolean,
     ColumnElement,
     DateTime,
     Float,
+    ForeignKey,
     Index,
     Integer,
     Label,
     LargeBinary,
     String,
+    UniqueConstraint,
     text,
     types,
 )
@@ -169,6 +172,7 @@ class Recordings(Base):
         ),
         Index("idx_recordings_thumbnail", "thumbnail_path"),
         Index("idx_recordings_clip", "clip_path"),
+        Index("idx_recordings_test", "test"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -191,6 +195,9 @@ class Recordings(Base):
     adjusted_start_time: Mapped[datetime.datetime | None] = mapped_column(
         UTCDateTime(timezone=False), nullable=False
     )
+    test: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=expression.false()
+    )
 
     def get_fragments(
         self, lookback: float, get_session: Callable[[], Session], now=None
@@ -210,7 +217,10 @@ class Objects(Base):
 
     __tablename__ = "objects"
 
-    __table_args__ = (Index("idx_objects_snapshot", "snapshot_path"),)
+    __table_args__ = (
+        Index("idx_objects_snapshot", "snapshot_path"),
+        Index("idx_objects_test", "test"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     camera_identifier: Mapped[str] = mapped_column(String)
@@ -230,6 +240,9 @@ class Objects(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), onupdate=UTCNow(), nullable=True
     )
+    test: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=expression.false()
+    )
 
 
 class Motion(Base):
@@ -237,7 +250,10 @@ class Motion(Base):
 
     __tablename__ = "motion"
 
-    __table_args__ = (Index("idx_motion_snapshot", "snapshot_path"),)
+    __table_args__ = (
+        Index("idx_motion_snapshot", "snapshot_path"),
+        Index("idx_motion_test", "test"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     camera_identifier: Mapped[str] = mapped_column(String)
@@ -251,6 +267,9 @@ class Motion(Base):
     )
     updated_at: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), onupdate=UTCNow(), nullable=True
+    )
+    test: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=expression.false()
     )
 
 
@@ -295,9 +314,109 @@ class Events(Base):
 
     __tablename__ = "events"
 
+    __table_args__ = (Index("idx_events_test", "test"),)
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String)
     data: Mapped[ColumnMeta] = mapped_column(JSONB)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), onupdate=UTCNow(), nullable=True
+    )
+    test: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=expression.false()
+    )
+
+
+class TestRun(Base):
+    """Database model for a test runner run."""
+
+    __tablename__ = "test_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), server_default=UTCNow(), nullable=False
+    )
+    finished_at: Mapped[datetime.datetime | None] = mapped_column(
+        UTCDateTime(timezone=False), nullable=True
+    )
+    total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    passed: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    failed: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, server_default="running"
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), onupdate=UTCNow(), nullable=True
+    )
+
+
+class TestResult(Base):
+    """Database model for an individual test runner result."""
+
+    __tablename__ = "test_results"
+
+    __table_args__ = (Index("idx_test_results_run_id", "run_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("test_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    case_name: Mapped[str] = mapped_column(String, nullable=False)
+    camera_identifier: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    expected: Mapped[ColumnMeta] = mapped_column(JSONB, nullable=False)
+    actual: Mapped[ColumnMeta] = mapped_column(JSONB, nullable=False)
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    video_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    snapshot_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    message: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), onupdate=UTCNow(), nullable=True
+    )
+
+
+class TestCase(Base):
+    """Database model for a persisted test case in the catalog.
+
+    Test cases created via the "Use for test" dialog live here so they
+    survive restarts and can be listed, re-used, and deleted from the UI.
+    Cases defined inline in ``config.yaml`` are NOT represented here; the
+    runner unions both sources at trigger time.
+    """
+
+    __tablename__ = "test_cases"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "camera_identifier",
+            "kind",
+            "polarity",
+            "slug",
+            name="uq_test_cases_camera_kind_polarity_slug",
+        ),
+        Index("idx_test_cases_camera", "camera_identifier"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    slug: Mapped[str] = mapped_column(String, nullable=False)
+    camera_identifier: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    polarity: Mapped[str] = mapped_column(String, nullable=False)
+    expected: Mapped[ColumnMeta] = mapped_column(JSONB, nullable=False)
+    video_path: Mapped[str] = mapped_column(String, nullable=False)
+    duration: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="15"
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
     )

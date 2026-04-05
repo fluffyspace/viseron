@@ -267,6 +267,7 @@ class AbstractRecorder(ABC, RecorderBase):
                     adjusted_start_time=start_time
                     - datetime.timedelta(seconds=self.lookback)
                     - datetime.timedelta(seconds=CAMERA_SEGMENT_DURATION),
+                    test=self._camera.is_test_camera,
                 )
                 .returning(Recordings.id)
             )

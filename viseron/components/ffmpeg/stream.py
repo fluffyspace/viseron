@@ -27,6 +27,7 @@ from .const import (
     CONFIG_FFMPEG_LOGLEVEL,
     CONFIG_FFMPEG_RECOVERABLE_ERRORS,
     CONFIG_FFPROBE_LOGLEVEL,
+    CONFIG_FILE_SOURCE,
     CONFIG_FPS,
     CONFIG_GLOBAL_ARGS,
     CONFIG_HEIGHT,
@@ -202,8 +203,21 @@ class Stream:
     def output_fps(self, fps) -> None:
         self._output_fps = fps
 
+    @staticmethod
+    def is_file_source(stream_config: dict[str, Any]) -> bool:
+        """Return True if this stream sources frames from a local file."""
+        return bool(stream_config.get(CONFIG_FILE_SOURCE))
+
     def get_stream_url(self, stream_config: dict[str, Any]) -> str:
-        """Return stream url."""
+        """Return stream url.
+
+        If the stream is configured with a ``file_source`` the absolute file
+        path is returned verbatim and all network-style parameters
+        (``host``, ``port``, ``path``, ``stream_format``) are ignored.
+        """
+        if self.is_file_source(stream_config):
+            return stream_config[CONFIG_FILE_SOURCE]
+
         username = self._config[CONFIG_USERNAME]
         password = self._config[CONFIG_PASSWORD]
         auth = ""
@@ -307,8 +321,15 @@ class Stream:
         self, stream_config: dict[str, Any], stream_codec: str, stream_url: str
     ):
         """Return FFmpeg input stream."""
+        file_source = self.is_file_source(stream_config)
+
         if stream_config[CONFIG_INPUT_ARGS]:
             input_args = stream_config[CONFIG_INPUT_ARGS]
+        elif file_source:
+            # File playback: pace decoding at native FPS so the downstream
+            # motion/object detectors see frames at the correct rate, and
+            # omit network-specific timeouts (they do not apply to files).
+            input_args = ["-re"]
         else:
             input_args = CAMERA_INPUT_ARGS + list(
                 STREAM_FORMAT_MAP[stream_config[CONFIG_STREAM_FORMAT]]["timeout_option"]
@@ -320,7 +341,8 @@ class Stream:
             + self.get_decoder_codec(stream_config, stream_codec)
             + (
                 ["-rtsp_transport", stream_config[CONFIG_RTSP_TRANSPORT]]
-                if stream_config[CONFIG_STREAM_FORMAT] == "rtsp"
+                if not file_source
+                and stream_config[CONFIG_STREAM_FORMAT] == "rtsp"
                 else []
             )
             + ["-i", stream_url]
@@ -634,6 +656,7 @@ class FFprobe:
         stream_config: dict[str, Any],
     ) -> dict[str, Any]:
         """Run FFprobe command."""
+        file_source = bool(stream_config.get(CONFIG_FILE_SOURCE))
         ffprobe_command = (
             [
                 "ffprobe",
@@ -650,7 +673,7 @@ class FFprobe:
             ]
             + (
                 ["-rtsp_transport", stream_config[CONFIG_RTSP_TRANSPORT]]
-                if stream_config[CONFIG_STREAM_FORMAT] == "rtsp"
+                if not file_source and stream_config[CONFIG_STREAM_FORMAT] == "rtsp"
                 else []
             )
             + [stream_url]

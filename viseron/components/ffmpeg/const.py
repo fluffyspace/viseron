@@ -79,6 +79,7 @@ CONFIG_RTSP_TRANSPORT = "rtsp_transport"
 CONFIG_VIDEO_FILTERS = "video_filters"
 CONFIG_PIX_FMT = "pix_fmt"
 CONFIG_FRAME_TIMEOUT = "frame_timeout"
+CONFIG_FILE_SOURCE = "file_source"
 
 DEFAULT_STREAM_FORMAT = "rtsp"
 DEFAULT_PROTOCOL: Final = None
@@ -93,6 +94,7 @@ DEFAULT_RTSP_TRANSPORT = "tcp"
 DEFAULT_VIDEO_FILTERS: list[str] = []
 DEFAULT_PIX_FMT = "nv12"
 DEFAULT_FRAME_TIMEOUT = 60
+DEFAULT_FILE_SOURCE: Final = None
 
 DESC_STREAM_FORMAT = "FFmpeg stream format."
 DESC_PROTOCOL = "Stream protocol."
@@ -139,6 +141,13 @@ DESC_PIX_FMT = (
 DESC_FRAME_TIMEOUT = (
     "A timeout in seconds. If a frame has not been received in this "
     "time period FFmpeg will be restarted."
+)
+DESC_FILE_SOURCE = (
+    "Absolute path to a local video file to use as the camera source. "
+    "Primarily used by the <code>test_runner</code> component so camera "
+    "configurations can be validated against pre-recorded clips. "
+    "When set, <code>host</code>, <code>port</code>, <code>path</code> and "
+    "<code>stream_format</code> are ignored."
 )
 
 # RECORDER_SCHEMA constants
@@ -197,6 +206,7 @@ CONFIG_FFPROBE_LOGLEVEL = "ffprobe_loglevel"
 CONFIG_RECORDER = "recorder"
 CONFIG_RAW_COMMAND = "raw_command"
 CONFIG_RECORD_ONLY = "record_only"
+CONFIG_TEST_MODE = "test_mode"
 
 DEFAULT_USERNAME: Final = None
 DEFAULT_PASSWORD: Final = None
@@ -215,6 +225,7 @@ DEFAULT_FFMPEG_RECOVERABLE_ERRORS = [
 DEFAULT_FFPROBE_LOGLEVEL = "error"
 DEFAULT_RAW_COMMAND: Final = None
 DEFAULT_RECORD_ONLY = False
+DEFAULT_TEST_MODE = False
 
 DESC_CAMERA = "Camera domain config."
 DESC_HOST = "IP or hostname of camera."
@@ -252,4 +263,9 @@ DESC_RECORD_ONLY = (
     "like object detection.<br>"
     "Be aware that this will record the main stream, making substream redundant. "
     "Still images will not work either unless you have setup `still_image`."
+)
+DESC_TEST_MODE = (
+    "Mark this camera as a test-runner camera. Detections produced by cameras "
+    "with this flag set are written with the <code>test</code> flag and do not "
+    "appear in the regular Events view."
 )

@@ -294,6 +294,17 @@ class AbstractCamera(AbstractDomain):
         return self._identifier
 
     @property
+    def is_test_camera(self) -> bool:
+        """Return True if this camera is a test-runner camera.
+
+        Test cameras feed pre-recorded videos into the pipeline so camera
+        configurations can be validated. All motion/object/recording rows
+        they produce are written with test=True so they do not mix with
+        live events in the regular UI.
+        """
+        return False
+
+    @property
     def mjpeg_streams(self):
         """Return mjpeg streams."""
         return self._config[CONFIG_MJPEG_STREAMS]
@@ -499,7 +510,13 @@ class AbstractCamera(AbstractDomain):
         text: str | None = None,
         subfolder: str | None = None,
     ) -> str:
-        """Save snapshot to disk."""
+        """Save snapshot to disk.
+
+        For test cameras the zoom-to-bounding-box crop is skipped so the
+        generated snapshot preserves the full frame with the detection
+        overlay drawn on top. This makes the Tests UI's visual report
+        useful for diagnosing why a case passed or failed.
+        """
         decoded_frame = self.shared_frames.get_decoded_frame_rgb(shared_frame)
         snapshot_frame = decoded_frame
 
@@ -512,7 +529,7 @@ class AbstractCamera(AbstractDomain):
                 text or None,
             )
 
-        if zoom_coordinates:
+        if zoom_coordinates and not self.is_test_camera:
             snapshot_frame = zoom_boundingbox(
                 decoded_frame,
                 calculate_absolute_coords(zoom_coordinates, self.resolution),

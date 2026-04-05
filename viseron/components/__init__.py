@@ -81,6 +81,13 @@ LOGGING_COMPONENTS = {"logger"}
 CORE_COMPONENTS = {"data_stream"}
 # Default components are always loaded even if they are not present in config
 DEFAULT_COMPONENTS = {"webserver", "storage"}
+# Pre-parallel components are set up sequentially after the default tier and
+# before the parallel thread pool. They are only loaded when explicitly
+# present in config. This tier exists so components which need to mutate
+# other components' config blocks (e.g. the test_runner injecting synthetic
+# ffmpeg camera entries for DB-backed test cases) can do so before the
+# affected components are instantiated.
+PRE_PARALLEL_COMPONENTS = {"test_runner"}
 # Critical components are required for Viseron to function properly
 # If one of these components fail to load, Viseron will activate safe mode
 CRITICAL_COMPONENTS = LOGGING_COMPONENTS | CORE_COMPONENTS | DEFAULT_COMPONENTS
@@ -795,6 +802,13 @@ def setup_components(vis: Viseron, config: dict[str, Any]) -> None:
         activate_safe_mode(vis)
         return
 
+    # Setup pre-parallel components sequentially so they can mutate the
+    # shared config dict before the parallel pool below reads it. Only runs
+    # for components actually present in config — unlike CORE/DEFAULT these
+    # are opt-in.
+    for component in components_in_config & PRE_PARALLEL_COMPONENTS:
+        setup_component(vis, get_component(vis, component, config))
+
     # Setup components in parallel
     setup_threads = []
     for component in (
@@ -802,6 +816,7 @@ def setup_components(vis: Viseron, config: dict[str, Any]) -> None:
         - set(LOGGING_COMPONENTS)
         - set(CORE_COMPONENTS)
         - set(DEFAULT_COMPONENTS)
+        - set(PRE_PARALLEL_COMPONENTS)
     ):
         setup_threads.append(
             threading.Thread(

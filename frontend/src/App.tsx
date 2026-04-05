@@ -20,6 +20,7 @@ const PublicLayout = lazy(() => import("layouts/PublicLayout"));
 const Recordings = lazy(() => import("pages/recordings/Recordings"));
 const Settings = lazy(() => import("pages/settings"));
 const SystemEvents = lazy(() => import("pages/settings/SystemEvents"));
+const Tests = lazy(() => import("pages/Tests"));
 const Users = lazy(() => import("pages/settings/Users"));
 const TemplateEditor = lazy(() => import("pages/settings/TemplateEditor"));
 
@@ -63,6 +64,10 @@ function App() {
         {
           path: "/entities",
           element: <Entities />,
+        },
+        {
+          path: "/tests",
+          element: <Tests />,
         },
         {
           element: <RequireRole userRole={["admin"]} />,

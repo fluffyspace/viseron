@@ -1,4 +1,5 @@
 import { SvgIconComponent } from "@mui/icons-material";
+import FactCheckIcon from "@mui/icons-material/FactCheck";
 import GitHubIcon from "@mui/icons-material/GitHub";
 import ImageSearchIcon from "@mui/icons-material/ImageSearch";
 import LiveTvIcon from "@mui/icons-material/LiveTv";
@@ -71,6 +72,7 @@ const getDrawerItems = (
       path: "/live",
     },
     { type: "link", title: "Entities", icon: ViewListIcon, path: "/entities" },
+    { type: "link", title: "Tests", icon: FactCheckIcon, path: "/tests" },
     ...(!auth.enabled || (auth.enabled && user?.role === "admin")
       ? [
           { type: "divider" } as DrawerItemTypes,

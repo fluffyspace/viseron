@@ -1,4 +1,5 @@
 import CalendarMonthIcon from "@mui/icons-material/CalendarMonth";
+import FactCheckIcon from "@mui/icons-material/FactCheck";
 import FileDownloadIcon from "@mui/icons-material/FileDownload";
 import VideocamIcon from "@mui/icons-material/Videocam";
 import Box from "@mui/material/Box";
@@ -10,6 +11,7 @@ import { memo, useState } from "react";
 import { CameraPickerDialog } from "components/camera/CameraPickerDialog";
 import { DatePickerDialog } from "components/events/DatePickerDialog";
 import { ExportDialog } from "components/events/ExportDialog";
+import { UseForTestDialog } from "components/tests/UseForTestDialog";
 
 type FloatingMenuProps = {
   date: Dayjs | null;
@@ -20,6 +22,7 @@ export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
   const [cameraDialogOpen, setCameraDialogOpen] = useState(false);
   const [dateDialogOpen, setDateDialogOpen] = useState(false);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [testDialogOpen, setTestDialogOpen] = useState(false);
 
   return (
     <>
@@ -37,6 +40,10 @@ export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
         }}
       />
       <ExportDialog open={exportDialogOpen} setOpen={setExportDialogOpen} />
+      <UseForTestDialog
+        open={testDialogOpen}
+        setOpen={setTestDialogOpen}
+      />
       <Box sx={{ position: "absolute", bottom: 14, right: 24 }}>
         <Tooltip title="Select Cameras">
           <Fab
@@ -65,6 +72,16 @@ export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
             onClick={() => setExportDialogOpen(true)}
           >
             <FileDownloadIcon />
+          </Fab>
+        </Tooltip>
+        <Tooltip title="Use for test">
+          <Fab
+            size="small"
+            color="primary"
+            sx={{ marginLeft: 1 }}
+            onClick={() => setTestDialogOpen(true)}
+          >
+            <FactCheckIcon />
           </Fab>
         </Tooltip>
       </Box>
