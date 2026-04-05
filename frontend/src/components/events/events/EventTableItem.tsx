@@ -18,10 +18,18 @@ import {
 import { useFirstRender } from "hooks/UseFirstRender";
 import {
   BLANK_IMAGE,
+  formatDuration,
   getCameraNameFromQueryCache,
   getTimeFromDate,
 } from "lib/helpers";
 import * as types from "lib/types";
+
+const getEventDurationSeconds = (event: types.CameraEvent): number | null => {
+  if (event.type === "motion" || event.type === "recording") {
+    return event.duration;
+  }
+  return null;
+};
 
 type EventTableItemIconsProps = {
   sortedEvents: types.CameraEvent[];
@@ -32,19 +40,18 @@ function EventTableItemIcons({ sortedEvents }: EventTableItemIconsProps) {
   const cameraName = getCameraNameFromQueryCache(
     sortedEvents[0].camera_identifier,
   );
+  const durationSeconds = getEventDurationSeconds(sortedEvents[0]);
+  const timeStr = getTimeFromDate(new Date(getEventTime(sortedEvents[0])));
 
   return (
     <div>
       <Typography fontSize=".75rem" fontWeight="bold" align="center">
         {cameraName}
       </Typography>
-      <Typography
-        fontSize=".75rem"
-        color="text.secondary"
-        align="center"
-      >{`${getTimeFromDate(
-        new Date(getEventTime(sortedEvents[0])),
-      )}`}</Typography>
+      <Typography fontSize=".75rem" color="text.secondary" align="center">
+        {timeStr}
+        {durationSeconds !== null && ` (${formatDuration(durationSeconds)})`}
+      </Typography>
       <Grid container justifyContent="center" alignItems="center">
         {Object.keys(uniqueEvents).map((key) => {
           // For object detection we want to group by label

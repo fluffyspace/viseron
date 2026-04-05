@@ -5,35 +5,55 @@ import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
 import Stack from "@mui/material/Stack";
 import { DateTimePicker } from "@mui/x-date-pickers/DateTimePicker";
-import { Dayjs } from "dayjs";
+import dayjs, { Dayjs } from "dayjs";
 import { useState } from "react";
 
 import { useFilteredCameras } from "components/camera/useCameraStore";
+import { useEventStore } from "components/events/utils";
 import { useExportTimespan } from "lib/commands";
 import { is12HourFormat } from "lib/helpers";
+import * as types from "lib/types";
+
+// Extract start/end timestamps (seconds) from a selected event for prefill.
+const getEventRange = (
+  event: types.CameraEvent,
+): { start: number; end: number } => {
+  if (event.type === "motion" || event.type === "recording") {
+    return {
+      start: event.start_timestamp,
+      end: event.end_timestamp ?? event.start_timestamp,
+    };
+  }
+  return { start: event.timestamp, end: event.timestamp };
+};
 
 type ExportDialogProps = {
   open: boolean;
   setOpen: (open: boolean) => void;
 };
 
-export function ExportDialog({ open, setOpen }: ExportDialogProps) {
-  const [startDate, setStartDate] = useState<Dayjs | null>(null);
-  const [endDate, setEndDate] = useState<Dayjs | null>(null);
+type ExportDialogBodyProps = {
+  setOpen: (open: boolean) => void;
+};
+
+// Body is only mounted while the dialog is open, so useState initializers
+// run fresh each time and snapshot the currently selected event for prefill.
+function ExportDialogBody({ setOpen }: ExportDialogBodyProps) {
+  const selectedEvent = useEventStore.getState().selectedEvent;
+  const initialRange = selectedEvent ? getEventRange(selectedEvent) : null;
+
+  const [startDate, setStartDate] = useState<Dayjs | null>(
+    initialRange ? dayjs.unix(initialRange.start) : null,
+  );
+  const [endDate, setEndDate] = useState<Dayjs | null>(
+    initialRange ? dayjs.unix(initialRange.end) : null,
+  );
 
   const filteredCameras = useFilteredCameras();
   const exportTimespan = useExportTimespan();
 
   const handleClose = () => {
     setOpen(false);
-  };
-
-  const handleStartDate = (newValue: Dayjs | null) => {
-    setStartDate(newValue);
-  };
-
-  const handleEndDate = (newValue: Dayjs | null) => {
-    setEndDate(newValue);
   };
 
   const handleExport = () => {
@@ -48,8 +68,9 @@ export function ExportDialog({ open, setOpen }: ExportDialogProps) {
 
   const isExportDisabled =
     !startDate || !endDate || endDate.isBefore(startDate);
+
   return (
-    <Dialog fullWidth maxWidth="xs" open={open} onClose={handleClose}>
+    <>
       <DialogTitle>Download Recording</DialogTitle>
       <DialogContent>
         <Stack spacing={3} sx={{ mt: 1 }}>
@@ -57,8 +78,8 @@ export function ExportDialog({ open, setOpen }: ExportDialogProps) {
             label="Start Date & Time"
             views={["year", "month", "day", "hours", "minutes", "seconds"]}
             value={startDate}
-            onAccept={handleStartDate}
-            onChange={handleStartDate}
+            onAccept={setStartDate}
+            onChange={setStartDate}
             closeOnSelect={false}
             ampm={is12HourFormat()}
           />
@@ -66,8 +87,8 @@ export function ExportDialog({ open, setOpen }: ExportDialogProps) {
             label="End Date & Time"
             views={["year", "month", "day", "hours", "minutes", "seconds"]}
             value={endDate}
-            onAccept={handleEndDate}
-            onChange={handleEndDate}
+            onAccept={setEndDate}
+            onChange={setEndDate}
             closeOnSelect={false}
             ampm={is12HourFormat()}
             minDateTime={startDate || undefined}
@@ -84,6 +105,19 @@ export function ExportDialog({ open, setOpen }: ExportDialogProps) {
           Download
         </Button>
       </DialogActions>
+    </>
+  );
+}
+
+export function ExportDialog({ open, setOpen }: ExportDialogProps) {
+  return (
+    <Dialog
+      fullWidth
+      maxWidth="xs"
+      open={open}
+      onClose={() => setOpen(false)}
+    >
+      {open && <ExportDialogBody setOpen={setOpen} />}
     </Dialog>
   );
 }
