@@ -247,6 +247,13 @@ class MQTT:
                 LOGGER.debug(f"Entity {entity.entity_id} has already been added")
                 return
 
+            # Skip entities belonging to test cameras.
+            if (
+                hasattr(entity, "_camera")
+                and getattr(entity._camera, "is_test_camera", False)
+            ):
+                return
+
             if (entity_class := ENTITY_OVERRIDES.get(type(entity))) or (
                 entity_class := ENTITY_MAP.get(entity.domain)
             ):
@@ -409,7 +416,6 @@ class MQTT:
             entity_id = event_data.data.entity_id
 
             if entity_id not in self._entities:
-                LOGGER.error(f"State change triggered for missing entity {entity_id}")
                 return
 
             self._entities[entity_id].publish_state()
