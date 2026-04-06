@@ -161,6 +161,8 @@ services:
       args:
         ARCH: amd64
         VISERON_VERSION: dev
+      cache_from:
+        - roflcoopter/amd64-viseron-tests:dev
     image: roflcoopter/amd64-viseron-tests:dev
     container_name: amd64-viseron-tests
     environment:
@@ -171,7 +173,7 @@ services:
         chown -R abc:abc /src &&
         su abc -c '
           cd /src &&
-          pytest --cov=viseron/ --cov-report term-missing -s tests &&
+          pytest --cov=viseron/ --cov-report term-missing -s -n auto tests &&
           coverage xml
         '
       "
@@ -186,6 +188,17 @@ services:
     command: >
       bash -c "vulture viseron/"
     user: 1000:1000
+
+  amd64-azure-agent:
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile.azure
+      args:
+        TARGETARCH: "amd64"
+        UBUNTU_VERSION: "$UBUNTU_VERSION"
+      cache_from:
+        - roflcoopter/amd64-azure-agent:latest
+    image: roflcoopter/amd64-azure-agent:latest
 
   ################ amd64 CUDA ###################################
   amd64-cuda-ffmpeg:
@@ -688,9 +701,9 @@ services:
   rpi5-azure-agent:
     build:
       context: ..
-      dockerfile: ./docker/rpi5/Dockerfile.azure
+      dockerfile: ./docker/Dockerfile.azure
       args:
-        TARGETARCH: "linux-arm64"
+        TARGETARCH: "arm64"
         UBUNTU_VERSION: "$UBUNTU_VERSION"
       cache_from:
         - roflcoopter/rpi5-azure-agent:latest

@@ -25,7 +25,6 @@ import TableHead from "@mui/material/TableHead";
 import TableRow from "@mui/material/TableRow";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
-import dayjs from "dayjs";
 import { useMemo, useState } from "react";
 
 import { useTitle } from "hooks/UseTitle";
@@ -40,6 +39,7 @@ import {
   useTestRuns,
   useTriggerTestRun,
 } from "lib/api/tests";
+import { getDayjsFromUnixTimestamp } from "lib/helpers/dates";
 import * as types from "lib/types";
 
 function statusColor(
@@ -56,7 +56,7 @@ function statusColor(
 
 function formatTimestamp(ts: number | null): string {
   if (!ts) return "—";
-  return dayjs.unix(ts).format("YYYY-MM-DD HH:mm:ss");
+  return getDayjsFromUnixTimestamp(ts).format("YYYY-MM-DD HH:mm:ss");
 }
 
 function SummaryCard({

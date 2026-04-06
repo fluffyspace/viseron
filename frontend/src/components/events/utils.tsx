@@ -1,11 +1,13 @@
-import AirIcon from "@mui/icons-material/Air";
-import DirectionsCarIcon from "@mui/icons-material/DirectionsCar";
-import PersonIcon from "@mui/icons-material/DirectionsWalk";
-import FaceIcon from "@mui/icons-material/Face";
-import ImageSearchIcon from "@mui/icons-material/ImageSearch";
-import PetsIcon from "@mui/icons-material/Pets";
-import VideoFileIcon from "@mui/icons-material/VideoFile";
-import dayjs, { Dayjs } from "dayjs";
+import {
+  Car,
+  DocumentVideo,
+  DogWalker,
+  FaceActivated,
+  IntrusionPrevention,
+  Movement,
+  UserActivity,
+} from "@carbon/icons-react";
+import { Dayjs } from "dayjs";
 import Hls, { Fragment } from "hls.js";
 import { useCallback } from "react";
 import { create } from "zustand";
@@ -16,18 +18,23 @@ import { useCameraStore } from "components/camera/useCameraStore";
 import LicensePlateRecognitionIcon from "components/icons/LicensePlateRecognition";
 import { useCameras } from "lib/api/cameras";
 import { useSubscribeTimespans } from "lib/commands";
-import { BLANK_IMAGE, dateToTimestamp } from "lib/helpers";
+import { BLANK_IMAGE } from "lib/helpers";
+import {
+  DATE_FORMAT,
+  getDayjs,
+  getDayjsFromUnixTimestamp,
+} from "lib/helpers/dates";
 import * as types from "lib/types";
 
 export const TICK_HEIGHT = 8;
 export const SCALE = 60;
 export const EXTRA_TICKS = 10;
-export const COLUMN_HEIGHT = "99dvh";
-export const COLUMN_HEIGHT_SMALL = "98.5dvh";
+export const COLUMN_HEIGHT = "98.2dvh";
+export const COLUMN_HEIGHT_SMALL = "98dvh";
 export const EVENT_ICON_HEIGHT = 30;
 export const LIVE_EDGE_DELAY = 10;
 
-export const playerCardSmMaxHeight = () => window.innerHeight * 0.4;
+export const playerCardSmMaxHeight = () => window.innerHeight * 0.5;
 
 // Get all possible keys from Filters
 export type FilterKeysFromFilters =
@@ -207,13 +214,23 @@ export const useReferencePlayerStore = create<ReferencePlayerStore>((set) => ({
   setIsMuted: (isMuted) => set({ isMuted }),
   playbackSpeed: 1,
   setPlaybackSpeed: (playbackSpeed) => set({ playbackSpeed }),
-  requestedTimestamp: dayjs().unix() - LIVE_EDGE_DELAY,
+  requestedTimestamp: getDayjs().unix() - LIVE_EDGE_DELAY,
   setRequestedTimestamp: (requestedTimestamp) =>
     set((state) => {
       state.playingDateRef.current = requestedTimestamp;
       return { ...state, requestedTimestamp };
     }),
-  playingDateRef: { current: dayjs().unix() - LIVE_EDGE_DELAY },
+  playingDateRef: { current: getDayjs().unix() - LIVE_EDGE_DELAY },
+}));
+
+interface ScrollingStore {
+  isScrolling: boolean;
+  setIsScrolling: (isScrolling: boolean) => void;
+}
+
+export const useScrollingStore = create<ScrollingStore>((set) => ({
+  isScrolling: false,
+  setIsScrolling: (isScrolling) => set({ isScrolling }),
 }));
 
 export const DEFAULT_ITEM: TimelineItem = {
@@ -236,7 +253,7 @@ export type TimelineItems = {
   [key: string]: TimelineItem;
 };
 
-// Get a Date object that corresponds to 'position'
+// Get a Dayjs object that corresponds to 'position'
 export const getDateAtPosition = (
   position: number,
   height: number,
@@ -248,15 +265,17 @@ export const getDateAtPosition = (
 
   // First time tick is preceded by a margin of half the time tick height
   // so we add half the scale to get the correct time
-  const _start = startRef.current * 1000 + (SCALE * 1000) / 2;
+  const _start = startRef.current + SCALE / 2;
   // Last time tick is followed by a margin of half the time tick height
   // so we subtract half the scale to get the correct time
-  const _end = endRef.current * 1000 - (SCALE * 1000) / 2;
-  // Calculate the time difference in milliseconds between start and end dates
+  const _end = endRef.current - SCALE / 2;
+  // Calculate the time difference in seconds between start and end dates
   const timeDifference = _end - _start;
 
   // Calculate the time corresponding to the cursor position
-  const dateAtCursor = new Date(_start + percentage * timeDifference);
+  const dateAtCursor = getDayjsFromUnixTimestamp(
+    _start + percentage * timeDifference,
+  );
   return dateAtCursor;
 };
 
@@ -282,30 +301,34 @@ export const getYPosition = (
 };
 
 // Round to neareset SCALE
-export const round = (num: number) => Math.ceil(num / SCALE) * SCALE;
+export const roundToScale = (num: number) => Math.ceil(num / SCALE) * SCALE;
 
 // Calculate the start time of the timeline, called on first render
 export const calculateStart = (date: Dayjs | null) => {
   if (!date) {
-    return round(dateToTimestamp(new Date()) + SCALE * EXTRA_TICKS);
+    return roundToScale(
+      getDayjs()
+        .add(SCALE * EXTRA_TICKS, "second")
+        .unix(),
+    );
   }
   // if date is today, start at current time
-  if (date.isSame(dayjs(), "day")) {
-    return round(dateToTimestamp(new Date()) + SCALE * EXTRA_TICKS);
+  if (date.isSame(getDayjs(), "day")) {
+    return roundToScale(
+      getDayjs()
+        .add(SCALE * EXTRA_TICKS, "second")
+        .unix(),
+    );
   }
   // Otherwise start at midnight the next day
-  return dateToTimestamp(
-    new Date(date.add(1, "day").toDate().setHours(0, 0, 0, 0)),
-  );
+  return date.add(1, "day").hour(0).minute(0).second(0).millisecond(0).unix();
 };
 
 // Calculate the end time of the timeline, called on first render
 export const calculateEnd = (date: Dayjs | null) =>
-  dateToTimestamp(
-    date
-      ? new Date(date.toDate().setHours(0, 0, 0, 0))
-      : new Date(new Date().setHours(0, 0, 0, 0)),
-  );
+  date
+    ? date.clone().hour(0).minute(0).second(0).millisecond(0).unix()
+    : getDayjs().hour(0).minute(0).second(0).millisecond(0).unix();
 
 // Calculate the number of items to render in the virtual list
 export const calculateItemCount = (
@@ -323,7 +346,7 @@ export const calculateTimeFromIndex = (
 export const calculateIndexFromTime = (
   startRef: React.MutableRefObject<number>,
   timestamp: number | null,
-) => Math.round((startRef.current - (timestamp || dayjs().unix())) / SCALE);
+) => Math.round((startRef.current - (timestamp || getDayjs().unix())) / SCALE);
 
 // Common logic for items that affect the activity line
 export function createActivityLineItem(
@@ -734,29 +757,29 @@ export const useSelectEvent = () => {
 const labelToIcon = (label: string) => {
   switch (label) {
     case "person":
-      return PersonIcon;
+      return UserActivity;
 
     case "car":
     case "truck":
     case "vehicle":
-      return DirectionsCarIcon;
+      return Car;
 
     case "dog":
     case "cat":
     case "animal":
-      return PetsIcon;
+      return DogWalker;
 
     default:
-      return ImageSearchIcon;
+      return IntrusionPrevention;
   }
 };
 
 const iconMap = {
-  object: PersonIcon,
-  face_recognition: FaceIcon,
+  object: UserActivity,
+  face_recognition: FaceActivated,
   license_plate_recognition: LicensePlateRecognitionIcon,
-  motion: AirIcon,
-  recording: VideoFileIcon,
+  motion: Movement,
+  recording: DocumentVideo,
 };
 
 export const getIcon = (event: types.CameraEvent) => {
@@ -773,8 +796,13 @@ export const getIcon = (event: types.CameraEvent) => {
   }
 };
 
-export const getIconFromType = (type: types.CameraEvent["type"]) =>
-  iconMap[type];
+export const getIconFromType = (type: types.CameraEvent["type"]) => {
+  const IconComponent = iconMap[type];
+  function IconWithSize() {
+    return <IconComponent size={20} />;
+  }
+  return IconWithSize;
+};
 
 // Base hook that contains shared logic
 const useTimespansBase = (
@@ -798,7 +826,7 @@ const useTimespansBase = (
 
   useSubscribeTimespans(
     selectedCameras,
-    date ? date.format("YYYY-MM-DD") : null,
+    date ? date.format(DATE_FORMAT) : null,
     callback,
     _enabled,
     debounce,

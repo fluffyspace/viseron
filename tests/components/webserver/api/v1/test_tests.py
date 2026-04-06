@@ -299,9 +299,14 @@ class TestCreateClip(TestAppBaseNoAuth):
         assert os.path.exists(expected_path)
         assert body["slug"] == "person_walks_by"
         assert body["case_id"] > 0
-        assert "file_source" in body["snippet"]
-        assert "test_runner" in body["snippet"]
-        assert "labels: ['person']" in body["snippet"]
+        # tests.yaml-style snippet: grouped by camera/kind/polarity with
+        # the clip path appearing under the matching label bucket.
+        assert "cameras:" in body["snippet"]
+        assert "  driveway:" in body["snippet"]
+        assert "    object:" in body["snippet"]
+        assert "      positive:" in body["snippet"]
+        assert "person:" in body["snippet"]
+        assert expected_path in body["snippet"]
         camera.fragmenter.concatenate_fragments.assert_called_once()
 
         # The happy path also persists a catalog row.
@@ -432,7 +437,8 @@ class TestCasesCatalog(TestAppBaseNoAuth):
         first = next(c for c in cases if c["id"] == _seed_catalog["case_id"])
         assert first["kind"] == "object"
         assert first["polarity"] == "positive"
-        assert "file_source" in first["snippet"]
+        # tests.yaml-style snippet rather than raw ffmpeg config.
+        assert "cameras:" in first["snippet"]
 
     def test_list_cases_filters_by_camera(self, _seed_catalog) -> None:
         response = self.fetch(

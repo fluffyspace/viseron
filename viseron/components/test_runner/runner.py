@@ -18,21 +18,26 @@ from viseron.components.storage.models import (
     TestResult,
     TestRun,
 )
+from viseron.const import LOADED
 from viseron.domains.camera import AbstractCamera
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
+from viseron.domains import setup_domain, setup_domains
 from viseron.exceptions import DomainNotRegisteredError
 from viseron.helpers import utcnow
 
 from .const import (
     CONFIG_CAMERA,
     CONFIG_CAMERA_READY_TIMEOUT,
-    CONFIG_CASES,
+    CONFIG_DEFAULT_DURATION,
     CONFIG_DURATION,
     CONFIG_EXPECTED,
     CONFIG_KIND,
     CONFIG_NAME,
+    CONFIG_POLARITY,
     CONFIG_SHUTDOWN_ON_COMPLETE,
+    CONFIG_SOURCE_CAMERA,
     CONFIG_VIDEO_PATH,
+    DEFAULT_DURATION,
     KIND_MOTION,
     KIND_OBJECT,
     STATUS_COMPLETE,
@@ -40,12 +45,28 @@ from .const import (
     STATUS_RUNNING,
 )
 from .evaluator import CaseOutcome, evaluate_case
+from .tests_yaml import (
+    _parse_datetime,
+    _slugify,
+    flatten_tests_yaml,
+    load_tests_yaml,
+)
+from .timeline import (
+    TimelineMaterializationError,
+    materialize_timeline_clip,
+)
 
 if TYPE_CHECKING:
     from viseron import Viseron
     from viseron.components.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
+
+
+# A runnable case is a plain dict with these keys, kept as loose
+# duck-typing so the runner can accept both tests.yaml-derived and
+# DB-derived descriptors without a shared class hierarchy.
+RunnerCase = dict[str, Any]
 
 
 @dataclass
@@ -65,29 +86,242 @@ class RunSummary:
         return self.status == STATUS_COMPLETE and self.failed == 0 and self.total > 0
 
 
-def _synth_test_camera_id(camera_identifier: str, slug: str) -> str:
-    """Return the synthetic ffmpeg camera identifier for a DB test case.
+# --- synthetic camera synthesis --------------------------------------------
 
-    Kept as a free function so both the injection step (setup time) and
-    the pending_restart check (request time) produce identical ids
-    without reaching into the ffmpeg component.
+
+def _synth_test_camera_id(camera_identifier: str, slug: str) -> str:
+    """Return a synthetic ffmpeg camera identifier for a test case.
+
+    Used by both the tests.yaml injection path and the DB-catalog
+    injection path. Deterministic so the pending_restart decoration in
+    the REST API can compute the same id at request time.
     """
     return f"test_{camera_identifier}_{slug}"
 
 
-def _build_case_dict(db_case: TestCase) -> dict[str, Any] | None:
-    """Convert a TestCase row into a runner-compatible case dict.
+def _clone_target_camera(target_config: dict[str, Any]) -> dict[str, Any]:
+    """Deep-clone a real camera's ffmpeg config for use as a test camera.
 
-    Returns ``None`` if the DB row is malformed (shouldn't happen given
-    the schema, but keeps the setup path defensive).
+    The clone is pruned of fields that don't apply to a file-sourced
+    stream (substreams, passwords) and stamped with placeholders for
+    network fields that ffmpeg still requires in its schema but ignores
+    when ``file_source`` is set.
     """
+    cloned = copy.deepcopy(target_config)
+    # file_source-backed cameras don't use a substream — drop it if the
+    # real camera had one so we don't spin up a second pipe to nowhere.
+    cloned.pop("substream", None)
+    # Credentials from the real camera are irrelevant for a local file.
+    cloned.pop("username", None)
+    cloned.pop("password", None)
+    # The network triple is required by the schema but unused when
+    # file_source is set; overwrite with safe placeholders.
+    cloned["host"] = "localhost"
+    cloned["port"] = 554
+    cloned["path"] = "/"
+    return cloned
+
+
+def _build_synthetic_camera(
+    target_config: dict[str, Any],
+    *,
+    display_name: str,
+    file_source: str,
+) -> dict[str, Any]:
+    """Turn a real camera config into a synthetic test-mode camera config."""
+    synth = _clone_target_camera(target_config)
+    synth["name"] = display_name
+    synth["test_mode"] = True
+    synth["file_source"] = file_source
+    return synth
+
+
+# --- tests.yaml driven injection -------------------------------------------
+
+
+def _resolve_source_to_file(
+    storage: "Storage | None",
+    camera_identifier: str,
+    slug: str,
+    source: Any,
+) -> str | None:
+    """Return an on-disk MP4 path for a flattened source entry.
+
+    Strings are returned verbatim (must be absolute paths). Mapping
+    sources are materialized from recorded fragments via the storage
+    layer. Returns ``None`` on any failure so the caller can skip the
+    case with a logged warning rather than aborting startup.
+    """
+    if isinstance(source, str):
+        return source
+    if not isinstance(source, dict):
+        LOGGER.warning(
+            "test_runner: unsupported source entry %r (expected path or "
+            "mapping with from/to)",
+            source,
+        )
+        return None
+    if storage is None:
+        LOGGER.warning(
+            "test_runner: cannot materialize timeline clip for camera %r — "
+            "storage component is not available",
+            camera_identifier,
+        )
+        return None
+    try:
+        start = _parse_datetime(source["from"])
+        end = _parse_datetime(source["to"])
+    except (KeyError, ValueError) as err:
+        LOGGER.warning(
+            "test_runner: invalid timeline range for camera %r: %s",
+            camera_identifier,
+            err,
+        )
+        return None
+    if end <= start:
+        LOGGER.warning(
+            "test_runner: timeline 'to' must be after 'from' for camera %r",
+            camera_identifier,
+        )
+        return None
+    try:
+        return materialize_timeline_clip(
+            storage, camera_identifier, start, end, slug
+        )
+    except TimelineMaterializationError as err:
+        LOGGER.warning(
+            "test_runner: could not materialize timeline clip for %r: %s",
+            camera_identifier,
+            err,
+        )
+        return None
+
+
+def _effective_duration(flat_case: dict[str, Any], default_duration: int) -> int:
+    """Clamp to at least 1 and fall back to default_duration when missing."""
+    raw = flat_case.get("duration") or default_duration
+    return max(1, int(raw))
+
+
+def inject_yaml_cases(
+    vis: "Viseron",
+    config: dict[str, Any],
+    tests_yaml: dict[str, Any],
+    *,
+    default_duration: int = DEFAULT_DURATION,
+) -> list[RunnerCase]:
+    """Flatten tests.yaml, synthesize ffmpeg test cameras, return runner cases.
+
+    For every leaf source in tests.yaml this function:
+
+    1. Resolves the source to an on-disk MP4 path (materializing timeline
+       ranges from the ``Files`` table when needed).
+    2. Deep-clones the parent real camera's ffmpeg config block.
+    3. Registers the clone as a synthetic ffmpeg camera with
+       ``test_mode=true`` and the resolved ``file_source``.
+    4. Emits a runner case dict referencing the synthetic camera.
+
+    Cases whose parent camera isn't under the ffmpeg component are
+    skipped with a warning. Cases whose source can't be resolved are
+    skipped with a warning. Neither is fatal — startup still proceeds,
+    the user just sees fewer runnable cases.
+    """
+    ffmpeg_cameras = config.get("ffmpeg", {}).get("camera")
+    if not isinstance(ffmpeg_cameras, dict):
+        LOGGER.warning(
+            "test_runner: no ffmpeg camera config present; tests.yaml cases "
+            "cannot be wired up. Declare at least one ffmpeg camera to "
+            "enable the test harness."
+        )
+        return []
+
+    storage = vis.data.get(STORAGE_COMPONENT)
+    flat_cases = flatten_tests_yaml(tests_yaml, default_duration=default_duration)
+    if not flat_cases:
+        return []
+
+    injected: list[RunnerCase] = []
+    for flat in flat_cases:
+        parent_id: str = flat["source_camera"]
+        target_config = ffmpeg_cameras.get(parent_id)
+        if target_config is None:
+            LOGGER.warning(
+                "test_runner: skipping case %r — parent camera %r is not "
+                "declared under the ffmpeg component",
+                flat["name"],
+                parent_id,
+            )
+            continue
+
+        resolved_path = _resolve_source_to_file(
+            storage, parent_id, flat["slug"], flat["source"]
+        )
+        if resolved_path is None:
+            continue
+
+        synth_id = _synth_test_camera_id(parent_id, flat["slug"])
+        if synth_id not in ffmpeg_cameras:
+            display_name = f"Test {parent_id} — {flat['name']}"
+            ffmpeg_cameras[synth_id] = _build_synthetic_camera(
+                target_config,
+                display_name=display_name,
+                file_source=resolved_path,
+            )
+            LOGGER.info(
+                "test_runner: injected synthetic camera %r for case %r",
+                synth_id,
+                flat["name"],
+            )
+
+        injected.append(
+            {
+                CONFIG_NAME: flat["name"],
+                CONFIG_CAMERA: synth_id,
+                CONFIG_SOURCE_CAMERA: parent_id,
+                CONFIG_KIND: flat["kind"],
+                CONFIG_POLARITY: flat["polarity"],
+                CONFIG_DURATION: _effective_duration(flat, default_duration),
+                CONFIG_EXPECTED: dict(flat["expected"]),
+                CONFIG_VIDEO_PATH: resolved_path,
+            }
+        )
+    return injected
+
+
+def load_and_inject_tests_yaml(
+    vis: "Viseron",
+    config: dict[str, Any],
+    path: str,
+    *,
+    default_duration: int = DEFAULT_DURATION,
+) -> list[RunnerCase]:
+    """Convenience wrapper used by setup(): load tests.yaml then inject."""
+    try:
+        tests_yaml = load_tests_yaml(path)
+    except Exception:  # pylint: disable=broad-except
+        LOGGER.exception("test_runner: failed to load tests.yaml at %s", path)
+        return []
+    if tests_yaml is None:
+        return []
+    return inject_yaml_cases(
+        vis, config, tests_yaml, default_duration=default_duration
+    )
+
+
+# --- DB-catalog driven injection (unchanged behavior, kept for the UI) -----
+
+
+def _build_db_case_dict(db_case: TestCase) -> RunnerCase | None:
+    """Convert a TestCase row into a runner-compatible case dict."""
     try:
         return {
             CONFIG_NAME: db_case.name,
             CONFIG_CAMERA: _synth_test_camera_id(
                 db_case.camera_identifier, db_case.slug
             ),
+            CONFIG_SOURCE_CAMERA: db_case.camera_identifier,
             CONFIG_KIND: db_case.kind,
+            CONFIG_POLARITY: db_case.polarity,
             CONFIG_DURATION: max(1, int(db_case.duration)),
             CONFIG_EXPECTED: dict(db_case.expected),
             CONFIG_VIDEO_PATH: db_case.video_path,
@@ -101,15 +335,13 @@ def _build_case_dict(db_case: TestCase) -> dict[str, Any] | None:
 
 def inject_db_cases(
     vis: "Viseron", config: dict[str, Any]
-) -> list[dict[str, Any]]:
-    """Read the test_cases table and inject synthetic ffmpeg cameras.
+) -> list[RunnerCase]:
+    """Read the ``test_cases`` table and inject synthetic ffmpeg cameras.
 
-    Called from :func:`test_runner.setup` during the pre-parallel tier so
-    mutations to ``config['ffmpeg']['camera']`` are visible to the ffmpeg
-    component's later setup. Returns a list of runner-compatible case
-    dicts, one per DB row whose target camera lives under ffmpeg. Cases
-    whose target isn't under ffmpeg are skipped with a warning — they
-    stay in the catalog but are never picked up by the runner.
+    Mirrors :func:`inject_yaml_cases` but sources its entries from the DB
+    catalog populated by the ``Use for test`` dialog. Both paths coexist
+    so the UI remains functional alongside the declarative tests.yaml
+    flow.
     """
     storage = vis.data.get(STORAGE_COMPONENT)
     if storage is None:
@@ -133,7 +365,7 @@ def inject_db_cases(
     if not db_rows:
         return []
 
-    injected_cases: list[dict[str, Any]] = []
+    injected_cases: list[RunnerCase] = []
     for row in db_rows:
         target_config = ffmpeg_cameras.get(row.camera_identifier)
         if target_config is None:
@@ -146,27 +378,16 @@ def inject_db_cases(
             continue
 
         test_camera_id = _synth_test_camera_id(row.camera_identifier, row.slug)
-        case_dict = _build_case_dict(row)
+        case_dict = _build_db_case_dict(row)
         if case_dict is None:
             continue
 
         if test_camera_id not in ffmpeg_cameras:
-            synthetic = {
-                "name": f"Test {row.camera_identifier} — {row.name}",
-                "host": "localhost",
-                "port": 554,
-                "path": "/",
-                "test_mode": True,
-                "file_source": row.video_path,
-            }
-            # Clone detector config from the target so detection behaviour
-            # matches the live camera as closely as possible. Use deepcopy
-            # so later validation passes can mutate freely without leaking
-            # back into the target camera's dict.
-            for key in ("motion_detector", "object_detector"):
-                if key in target_config:
-                    synthetic[key] = copy.deepcopy(target_config[key])
-            ffmpeg_cameras[test_camera_id] = synthetic
+            ffmpeg_cameras[test_camera_id] = _build_synthetic_camera(
+                target_config,
+                display_name=f"Test {row.camera_identifier} — {row.name}",
+                file_source=row.video_path,
+            )
             LOGGER.info(
                 "injected test camera %r for db case %r (target: %r)",
                 test_camera_id,
@@ -178,24 +399,39 @@ def inject_db_cases(
     return injected_cases
 
 
+# --- component holder ------------------------------------------------------
+
+
 class TestRunnerComponent:
     """Holder object stored on ``vis.data`` for the duration of the process.
 
-    A single ``TestRunner`` instance represents one execution. This holder
-    lets callers (the CLI, the REST endpoint) trigger fresh runs without
-    re-instantiating the component, and surfaces the currently active run
-    (if any) for status queries.
+    Keeps two parallel sources of runnable cases:
+
+    * ``yaml_cases`` — produced once at setup time from tests.yaml by
+      :func:`inject_yaml_cases`. These have matching synthetic ffmpeg
+      cameras registered before the ffmpeg component set up.
+    * ``db_cases`` — produced from the ``test_cases`` catalog table,
+      refreshed on demand by the REST layer when the user creates a
+      case via the UI.
+
+    Both are unioned at ``trigger_run`` time. DB cases whose synthesized
+    camera hasn't been registered yet (pending restart) are skipped.
     """
 
     def __init__(
         self,
         vis: "Viseron",
         config: dict[str, Any],
-        db_cases: list[dict[str, Any]] | None = None,
+        *,
+        yaml_cases: list[RunnerCase] | None = None,
+        db_cases: list[RunnerCase] | None = None,
+        ffmpeg_cameras: dict[str, Any] | None = None,
     ) -> None:
         self._vis = vis
         self._config = config
-        self._db_cases: list[dict[str, Any]] = db_cases or []
+        self._yaml_cases: list[RunnerCase] = yaml_cases or []
+        self._db_cases: list[RunnerCase] = db_cases or []
+        self._ffmpeg_cameras = ffmpeg_cameras
         self._current_runner: "TestRunner | None" = None
         self._lock = threading.Lock()
 
@@ -205,37 +441,79 @@ class TestRunnerComponent:
         return self._config
 
     @property
-    def db_cases(self) -> list[dict[str, Any]]:
-        """Runner-compatible case dicts derived from the test_cases table.
+    def yaml_cases(self) -> list[RunnerCase]:
+        """Runner-ready case dicts generated from tests.yaml at setup time."""
+        return list(self._yaml_cases)
 
-        Populated at setup time by :func:`inject_db_cases`. The runner
-        unions these with the config.yaml cases at trigger time and skips
-        any whose synthesized camera isn't registered (which happens when
-        a case was added after the process started and no restart has
-        occurred yet).
-        """
+    @property
+    def db_cases(self) -> list[RunnerCase]:
+        """Runner-ready case dicts derived from the test_cases table."""
         return list(self._db_cases)
 
     def refresh_db_cases(self) -> None:
-        """Reload DB cases without re-injecting ffmpeg config.
+        """Reload DB cases, injecting and registering new cameras at runtime.
 
-        Used by the REST layer so ``GET /tests/cases`` and
-        ``trigger_run`` see newly inserted cases without waiting for a
-        restart. Cases added here still require a restart to *run*
-        (their synthetic ffmpeg camera isn't registered), but the
-        pending_restart indicator picks them up immediately.
+        Used by the REST layer after a test case is created via the UI.
+        New cases get their synthetic ffmpeg camera injected into the
+        config and registered on the fly, so they become runnable
+        immediately without a Viseron restart.
         """
         storage = self._vis.data.get(STORAGE_COMPONENT)
         if storage is None:
             return
         with storage.get_session() as session:
             rows = session.execute(select(TestCase)).scalars().all()
-        refreshed: list[dict[str, Any]] = []
+
+        ffmpeg_component = self._vis.data[LOADED].get("ffmpeg")
+        ffmpeg_cameras = self._ffmpeg_cameras
+
+        new_cameras_injected = False
+        refreshed: list[RunnerCase] = []
         for row in rows:
-            case_dict = _build_case_dict(row)
-            if case_dict is not None:
-                refreshed.append(case_dict)
+            case_dict = _build_db_case_dict(row)
+            if case_dict is None:
+                continue
+            refreshed.append(case_dict)
+
+            # If the synthetic camera isn't registered yet, inject it now.
+            test_camera_id = _synth_test_camera_id(
+                row.camera_identifier, row.slug
+            )
+            try:
+                self._vis.get_registered_domain(CAMERA_DOMAIN, test_camera_id)
+            except DomainNotRegisteredError:
+                if not ffmpeg_cameras or not ffmpeg_component:
+                    continue
+                target_config = ffmpeg_cameras.get(row.camera_identifier)
+                if target_config is None:
+                    continue
+                if test_camera_id not in ffmpeg_cameras:
+                    ffmpeg_cameras[test_camera_id] = _build_synthetic_camera(
+                        target_config,
+                        display_name=f"Test {row.camera_identifier} — {row.name}",
+                        file_source=row.video_path,
+                    )
+                # Register the camera domain for setup
+                pruned = {test_camera_id: ffmpeg_cameras[test_camera_id]}
+                setup_domain(
+                    self._vis,
+                    "ffmpeg",
+                    CAMERA_DOMAIN,
+                    pruned,
+                    identifier=test_camera_id,
+                )
+                new_cameras_injected = True
+                LOGGER.info(
+                    "runtime-injected test camera %r for db case %r",
+                    test_camera_id,
+                    row.name,
+                )
+
         self._db_cases = refreshed
+
+        # Set up any newly registered cameras
+        if new_cameras_injected:
+            setup_domains(self._vis)
 
     @property
     def current_runner(self) -> "TestRunner | None":
@@ -248,22 +526,22 @@ class TestRunnerComponent:
         runner = self._current_runner
         return runner is not None and not runner.completion_event.is_set()
 
-    def _collect_runnable_cases(self) -> list[dict[str, Any]]:
-        """Union config.yaml cases with DB cases that have live cameras.
+    def _collect_runnable_cases(self) -> list[RunnerCase]:
+        """Union tests.yaml cases with DB cases that have live cameras.
 
-        DB cases whose synthesized camera is not registered yet (pending
-        restart) are skipped with a clear log line.
+        YAML cases are always runnable — their synthetic cameras were
+        registered at setup time. DB cases are normally registered at
+        runtime by refresh_db_cases; any that still lack a camera are
+        skipped as a safety net.
         """
-        config_cases = list(self._config.get(CONFIG_CASES, []))
-        runnable: list[dict[str, Any]] = list(config_cases)
+        runnable: list[RunnerCase] = list(self._yaml_cases)
         for case in self._db_cases:
             camera_id = case[CONFIG_CAMERA]
             try:
                 self._vis.get_registered_domain(CAMERA_DOMAIN, camera_id)
             except DomainNotRegisteredError:
-                LOGGER.info(
-                    "skipping db case %r — camera %r is not registered "
-                    "(restart Viseron to pick it up)",
+                LOGGER.warning(
+                    "skipping db case %r — camera %r is not registered",
                     case[CONFIG_NAME],
                     camera_id,
                 )
@@ -279,15 +557,19 @@ class TestRunnerComponent:
             cases = self._collect_runnable_cases()
             if not cases:
                 raise RuntimeError(
-                    "no runnable test cases — configure cases under the "
-                    "test_runner block in config.yaml or create one via "
-                    "the 'Use for test' dialog and restart Viseron"
+                    "no runnable test cases — declare them under 'cameras' "
+                    "in tests.yaml or create one via the 'Use for test' "
+                    "dialog (and restart Viseron for catalog cases)"
                 )
-            merged_config = {**self._config, CONFIG_CASES: cases}
+            merged_config = dict(self._config)
+            merged_config["cases"] = cases
             runner = TestRunner(self._vis, merged_config)
             self._current_runner = runner
             runner.start()
             return runner
+
+
+# --- runner ----------------------------------------------------------------
 
 
 class TestRunner:
@@ -296,7 +578,7 @@ class TestRunner:
     def __init__(self, vis: "Viseron", config: dict[str, Any]) -> None:
         self._vis = vis
         self._config = config
-        self._cases: list[dict[str, Any]] = config[CONFIG_CASES]
+        self._cases: list[RunnerCase] = config["cases"]
         self._storage: "Storage" = vis.data[STORAGE_COMPONENT]
         self._thread: threading.Thread | None = None
         self._completion = threading.Event()
@@ -469,8 +751,8 @@ class TestRunner:
     def _evaluate_all(
         self,
         cameras: dict[str, AbstractCamera],
-    ) -> list[tuple[dict[str, Any], CaseOutcome]]:
-        results: list[tuple[dict[str, Any], CaseOutcome]] = []
+    ) -> list[tuple[RunnerCase, CaseOutcome]]:
+        results: list[tuple[RunnerCase, CaseOutcome]] = []
         for case in self._cases:
             camera = cameras[case[CONFIG_CAMERA]]
             outcome = evaluate_case(
@@ -485,7 +767,7 @@ class TestRunner:
     def _persist_results(
         self,
         run_id: int,
-        outcomes: list[tuple[dict[str, Any], CaseOutcome]],
+        outcomes: list[tuple[RunnerCase, CaseOutcome]],
     ) -> None:
         with self._storage.get_session() as session:
             for case, outcome in outcomes:
@@ -529,12 +811,14 @@ class TestRunner:
             LOGGER.error("test_runner: run %d errored: %s", run_id, error)
 
 
-# Kinds are exported so tests and the CLI can inspect them without reaching
-# into const.py.
 __all__ = [
+    "RunSummary",
     "TestRunner",
     "TestRunnerComponent",
-    "RunSummary",
+    "inject_db_cases",
+    "inject_yaml_cases",
+    "load_and_inject_tests_yaml",
     "KIND_MOTION",
     "KIND_OBJECT",
+    "_synth_test_camera_id",
 ]

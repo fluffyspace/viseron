@@ -18,10 +18,8 @@ from viseron.components.storage.models import (
     TestRun,
 )
 from viseron.components.test_runner.const import (
-    COMPONENT,
     CONFIG_CAMERA,
     CONFIG_CAMERA_READY_TIMEOUT,
-    CONFIG_CASES,
     CONFIG_DURATION,
     CONFIG_EXPECTED,
     CONFIG_KIND,
@@ -32,12 +30,14 @@ from viseron.components.test_runner.const import (
     EXPECTED_LABELS,
     KIND_MOTION,
     KIND_OBJECT,
+    POLARITY_POSITIVE,
     STATUS_COMPLETE,
 )
 from viseron.components.test_runner.runner import (
     TestRunner,
     TestRunnerComponent,
     inject_db_cases,
+    inject_yaml_cases,
 )
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.exceptions import DomainNotRegisteredError
@@ -85,14 +85,19 @@ def _test_camera(identifier: str, *, is_test: bool = True) -> SimpleNamespace:
     return SimpleNamespace(identifier=identifier, is_test_camera=is_test)
 
 
-def _make_config(
+def _make_runner_config(
     cases: list[dict[str, Any]],
     *,
     shutdown_on_complete: bool = False,
     camera_ready_timeout: int = 5,
 ) -> dict[str, Any]:
+    """Build the dict that TestRunner is constructed with.
+
+    Mirrors what ``TestRunnerComponent.trigger_run`` assembles: the
+    settings block plus a ``cases`` key listing the runnable descriptors.
+    """
     return {
-        CONFIG_CASES: cases,
+        "cases": cases,
         CONFIG_SHUTDOWN_ON_COMPLETE: shutdown_on_complete,
         CONFIG_CAMERA_READY_TIMEOUT: camera_ready_timeout,
     }
@@ -149,7 +154,7 @@ class TestClearStaleDetections:
         vis = _FakeViseron(get_db_session, cameras)
         runner = TestRunner(
             vis,
-            _make_config(
+            _make_runner_config(
                 [
                     {
                         CONFIG_NAME: "case",
@@ -193,7 +198,7 @@ class TestFullRun:
         vis = _FakeViseron(get_db_session, cameras)
         runner = TestRunner(
             vis,
-            _make_config(cases, shutdown_on_complete=shutdown_on_complete),
+            _make_runner_config(cases, shutdown_on_complete=shutdown_on_complete),
         )
         # Skip the wall-clock sleep so tests run instantly.
         monkeypatch.setattr(
@@ -372,11 +377,7 @@ class TestFullRun:
         vis = _FakeViseron(get_db_session, cameras={})
         runner = TestRunner(
             vis,
-            {
-                CONFIG_CASES: cases,
-                CONFIG_SHUTDOWN_ON_COMPLETE: False,
-                CONFIG_CAMERA_READY_TIMEOUT: 1,
-            },
+            _make_runner_config(cases, camera_ready_timeout=1),
         )
         monkeypatch.setattr(
             runner, "_clear_stale_detections", lambda: None
@@ -392,7 +393,176 @@ class TestFullRun:
         assert "does_not_exist" in (runner.summary.error or "")
 
 
-# --- Slice D: inject_db_cases + TestRunnerComponent case unioning ----------
+# --- inject_yaml_cases ------------------------------------------------------
+
+
+def _ffmpeg_config(**cameras: dict[str, Any]) -> dict[str, Any]:
+    return {"ffmpeg": {"camera": cameras}, "test_runner": {}}
+
+
+class TestInjectYamlCases:
+    """Unit tests for runner.inject_yaml_cases.
+
+    tests.yaml is the new entry point: users declare sources grouped by
+    real camera, and the injector synthesizes a test-mode ffmpeg camera
+    per source. No synthetic-camera YAML has to be written by hand.
+    """
+
+    def test_file_sources_clone_parent_camera_per_case(
+        self, get_db_session: sessionmaker[Session]
+    ) -> None:
+        config = _ffmpeg_config(
+            garage={
+                "host": "10.0.0.1",
+                "port": 554,
+                "path": "/live",
+                "motion_detector": {"fps": 2, "threshold": 10},
+                "object_detector": {"labels": [{"label": "person"}]},
+            }
+        )
+        tests_yaml = {
+            "cameras": {
+                "garage": {
+                    KIND_MOTION: {
+                        POLARITY_POSITIVE: ["/videos/walk.mp4"],
+                    },
+                    KIND_OBJECT: {
+                        POLARITY_POSITIVE: {
+                            "person": ["/videos/person.mp4"],
+                        },
+                    },
+                }
+            }
+        }
+        vis = _FakeViseron(get_db_session, cameras={})
+
+        cases = inject_yaml_cases(vis, config, tests_yaml)
+
+        # One case per leaf source.
+        assert len(cases) == 2
+        by_name = {c[CONFIG_NAME]: c for c in cases}
+        assert "walk" in by_name and "person" in by_name
+
+        motion_case = by_name["walk"]
+        assert motion_case[CONFIG_CAMERA] == "test_garage_walk"
+        assert motion_case[CONFIG_KIND] == KIND_MOTION
+        assert motion_case[CONFIG_EXPECTED] == {EXPECTED_DETECTED: True}
+        assert motion_case[CONFIG_VIDEO_PATH] == "/videos/walk.mp4"
+
+        object_case = by_name["person"]
+        assert object_case[CONFIG_EXPECTED] == {EXPECTED_LABELS: ["person"]}
+
+        synth = config["ffmpeg"]["camera"]["test_garage_walk"]
+        assert synth["test_mode"] is True
+        assert synth["file_source"] == "/videos/walk.mp4"
+        # Deep-clone means mutating the clone doesn't touch the real camera.
+        assert synth["motion_detector"] == {"fps": 2, "threshold": 10}
+        synth["motion_detector"]["fps"] = 99
+        assert (
+            config["ffmpeg"]["camera"]["garage"]["motion_detector"]["fps"] == 2
+        )
+        # Credentials and network fields on the clone are sanitized.
+        assert synth["host"] == "localhost"
+        assert synth["port"] == 554
+        assert synth["path"] == "/"
+
+    def test_skips_cases_whose_parent_is_not_under_ffmpeg(
+        self, get_db_session: sessionmaker[Session]
+    ) -> None:
+        config = _ffmpeg_config(
+            garage={"host": "10.0.0.1", "port": 554, "path": "/live"}
+        )
+        tests_yaml = {
+            "cameras": {
+                "backyard": {  # not declared under ffmpeg
+                    KIND_MOTION: {POLARITY_POSITIVE: ["/videos/x.mp4"]},
+                }
+            }
+        }
+        vis = _FakeViseron(get_db_session, cameras={})
+
+        cases = inject_yaml_cases(vis, config, tests_yaml)
+
+        assert cases == []
+        # No synthetic entry was created for the unknown target.
+        assert list(config["ffmpeg"]["camera"].keys()) == ["garage"]
+
+    def test_timeline_source_is_materialized_via_helper(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        get_db_session: sessionmaker[Session],
+    ) -> None:
+        """Timeline sources delegate to materialize_timeline_clip.
+
+        We monkeypatch the helper so the unit test doesn't need a real
+        ffmpeg binary or recorded fragments. The assertion is that the
+        helper is invoked with the parent camera and parsed datetimes,
+        and that the returned path is threaded into the synthetic
+        camera's ``file_source``.
+        """
+        calls: list[tuple[str, str, str, str]] = []
+
+        def fake_materialize(
+            _storage: Any,
+            camera_identifier: str,
+            start: datetime.datetime,
+            end: datetime.datetime,
+            slug: str,
+        ) -> str:
+            calls.append(
+                (camera_identifier, start.isoformat(), end.isoformat(), slug)
+            )
+            return f"/cache/{camera_identifier}/{slug}.mp4"
+
+        monkeypatch.setattr(
+            "viseron.components.test_runner.runner.materialize_timeline_clip",
+            fake_materialize,
+        )
+        config = _ffmpeg_config(
+            garage={"host": "10.0.0.1", "port": 554, "path": "/live"}
+        )
+        tests_yaml = {
+            "cameras": {
+                "garage": {
+                    KIND_MOTION: {
+                        POLARITY_POSITIVE: [
+                            {
+                                "from": "2026-01-15T14:30:00+00:00",
+                                "to": "2026-01-15T14:31:00+00:00",
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+        vis = _FakeViseron(get_db_session, cameras={})
+
+        cases = inject_yaml_cases(vis, config, tests_yaml)
+
+        assert len(cases) == 1
+        assert len(calls) == 1
+        camera, start_iso, end_iso, slug = calls[0]
+        assert camera == "garage"
+        assert start_iso.startswith("2026-01-15T14:30:00")
+        assert end_iso.startswith("2026-01-15T14:31:00")
+        assert cases[0][CONFIG_VIDEO_PATH] == f"/cache/garage/{slug}.mp4"
+        synth = config["ffmpeg"]["camera"][f"test_garage_{slug}"]
+        assert synth["file_source"] == f"/cache/garage/{slug}.mp4"
+
+    def test_no_ffmpeg_config_yields_no_cases(
+        self, get_db_session: sessionmaker[Session]
+    ) -> None:
+        config: dict[str, Any] = {"test_runner": {}}
+        tests_yaml = {
+            "cameras": {
+                "garage": {KIND_MOTION: {POLARITY_POSITIVE: ["/videos/x.mp4"]}}
+            }
+        }
+        vis = _FakeViseron(get_db_session, cameras={})
+        assert inject_yaml_cases(vis, config, tests_yaml) == []
+
+
+# --- inject_db_cases (UI dialog path) ---------------------------------------
 
 
 def _insert_test_case(
@@ -429,7 +599,7 @@ def _insert_test_case(
 
 
 class TestInjectDbCases:
-    """Unit tests for runner.inject_db_cases."""
+    """Unit tests for runner.inject_db_cases (catalog path)."""
 
     def test_injects_synthetic_camera_and_clones_detector_config(
         self, get_db_session: sessionmaker[Session]
@@ -449,7 +619,7 @@ class TestInjectDbCases:
                     }
                 }
             },
-            "test_runner": {"cases": []},
+            "test_runner": {},
         }
         vis = _FakeViseron(get_db_session, cameras={})
         cases = inject_db_cases(vis, config)
@@ -478,7 +648,7 @@ class TestInjectDbCases:
         )
         config = {
             "ffmpeg": {"camera": {"driveway": {"host": "10.0.0.1"}}},
-            "test_runner": {"cases": []},
+            "test_runner": {},
         }
         vis = _FakeViseron(get_db_session, cameras={})
         cases = inject_db_cases(vis, config)
@@ -508,7 +678,7 @@ class TestInjectDbCases:
                     "test_driveway_walk": existing,
                 }
             },
-            "test_runner": {"cases": []},
+            "test_runner": {},
         }
         vis = _FakeViseron(get_db_session, cameras={})
         cases = inject_db_cases(vis, config)
@@ -525,21 +695,21 @@ class TestInjectDbCases:
         _insert_test_case(
             get_db_session, name="walk", camera_identifier="driveway"
         )
-        config = {"test_runner": {"cases": []}}
+        config = {"test_runner": {}}
         vis = _FakeViseron(get_db_session, cameras={})
         cases = inject_db_cases(vis, config)
         assert cases == []
 
 
 class TestRunnerComponentCaseUnioning:
-    """TestRunnerComponent unions config cases + runnable DB cases."""
+    """TestRunnerComponent unions yaml cases + runnable DB cases."""
 
-    def test_trigger_run_includes_both_config_and_db_cases(
+    def test_trigger_run_includes_both_yaml_and_db_cases(
         self,
         monkeypatch: pytest.MonkeyPatch,
         get_db_session: sessionmaker[Session],
     ) -> None:
-        config_case = {
+        yaml_case = {
             CONFIG_NAME: "yaml case",
             CONFIG_CAMERA: "yaml_test_cam",
             CONFIG_KIND: KIND_MOTION,
@@ -562,10 +732,10 @@ class TestRunnerComponentCaseUnioning:
         component = TestRunnerComponent(
             vis,
             {
-                CONFIG_CASES: [config_case],
                 CONFIG_SHUTDOWN_ON_COMPLETE: False,
                 CONFIG_CAMERA_READY_TIMEOUT: 1,
             },
+            yaml_cases=[yaml_case],
             db_cases=[db_case],
         )
         merged = component._collect_runnable_cases()  # pylint: disable=protected-access
@@ -598,10 +768,10 @@ class TestRunnerComponentCaseUnioning:
         component = TestRunnerComponent(
             vis,
             {
-                CONFIG_CASES: [yaml_case],
                 CONFIG_SHUTDOWN_ON_COMPLETE: False,
                 CONFIG_CAMERA_READY_TIMEOUT: 1,
             },
+            yaml_cases=[yaml_case],
             db_cases=[db_case],
         )
         merged = component._collect_runnable_cases()  # pylint: disable=protected-access
@@ -615,10 +785,10 @@ class TestRunnerComponentCaseUnioning:
         component = TestRunnerComponent(
             vis,
             {
-                CONFIG_CASES: [],
                 CONFIG_SHUTDOWN_ON_COMPLETE: False,
                 CONFIG_CAMERA_READY_TIMEOUT: 1,
             },
+            yaml_cases=[],
             db_cases=[],
         )
         with pytest.raises(RuntimeError, match="no runnable test cases"):

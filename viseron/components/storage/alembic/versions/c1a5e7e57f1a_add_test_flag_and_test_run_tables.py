@@ -1,7 +1,7 @@
 """Add test flag to event tables and create test_runs / test_results tables.
 
 Revision ID: c1a5e7e57f1a
-Revises: a6397b8c2fc9
+Revises: 7f6d3739fcd6
 Create Date: 2026-04-05 00:00:00.000000
 
 """
@@ -12,7 +12,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str | None = "c1a5e7e57f1a"
-down_revision: str | None = "a6397b8c2fc9"
+down_revision: str | None = "7f6d3739fcd6"
 branch_labels: str | None = None
 depends_on: str | None = None
 

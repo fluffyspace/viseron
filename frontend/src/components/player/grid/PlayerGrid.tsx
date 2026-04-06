@@ -54,6 +54,12 @@ const PlayerItem = forwardRef<PlayerItemRef, PlayerItemProps>(
           ref={boxRef}
           sx={{
             position: "relative",
+            maxWidth: "100%",
+            maxHeight: "100%",
+            overflow: "hidden",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
           }}
         >
           {renderPlayer(camera, playerRef)}
@@ -75,12 +81,14 @@ type PlayerGridProps = {
     playerRef: React.RefObject<any>,
   ) => JSX.Element;
   forceBreakpoint?: boolean;
+  useDoubleColumnMobile?: boolean;
 };
 export function PlayerGrid({
   cameras,
   containerRef,
   renderPlayer,
   forceBreakpoint,
+  useDoubleColumnMobile,
 }: PlayerGridProps) {
   const playerItemRefs = useRef<(PlayerItemRef | null)[]>([]);
   const setPlayerItemRef = (index: number, ref: PlayerItemRef | null) => {
@@ -95,13 +103,23 @@ export function PlayerGrid({
     });
   };
 
-  const gridLayout = useGridLayout(containerRef, cameras, setPlayerItemsSize);
+  const gridLayout = useGridLayout(
+    containerRef,
+    cameras,
+    setPlayerItemsSize,
+    undefined,
+    useDoubleColumnMobile,
+  );
 
   return (
     <Grid
       container
       spacing={0}
-      sx={{ height: "100%" }}
+      sx={{
+        height: "100%",
+        maxHeight: "100%",
+        overflow: "hidden",
+      }}
       alignContent="center"
       justifyContent="center"
     >

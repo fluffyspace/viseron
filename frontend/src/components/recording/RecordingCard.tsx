@@ -1,4 +1,9 @@
-import DeleteForeverIcon from "@mui/icons-material/DeleteForever";
+import {
+  CenterSquare,
+  FaceActivated,
+  Movement,
+  TrashCan,
+} from "@carbon/icons-react";
 import Card from "@mui/material/Card";
 import CardActions from "@mui/material/CardActions";
 import CardContent from "@mui/material/CardContent";
@@ -10,10 +15,15 @@ import { useTheme } from "@mui/material/styles";
 import LazyLoad from "react-lazyload";
 
 import MutationIconButton from "components/buttons/MutationIconButton";
+import LicensePlateRecognitionIcon from "components/icons/LicensePlateRecognition";
+import { getVideoElement } from "components/player/utils";
 import VideoPlayerPlaceholder from "components/player/videoplayer/VideoPlayerPlaceholder";
 import { useAuthContext } from "context/AuthContext";
 import { useDeleteRecording } from "lib/api/recordings";
-import { getTimeFromDate, getVideoElement } from "lib/helpers";
+import {
+  getDayjsFromDateTimeString,
+  getTimeStringFromDayjs,
+} from "lib/helpers/dates";
 import * as types from "lib/types";
 
 interface RecordingCardInterface {
@@ -26,7 +36,7 @@ export default function RecordingCard({
   recording,
 }: RecordingCardInterface) {
   const theme = useTheme();
-  const { auth, user } = useAuthContext();
+  const { user } = useAuthContext();
   const deleteRecording = useDeleteRecording();
 
   return (
@@ -45,9 +55,35 @@ export default function RecordingCard({
       }
     >
       <CardContent>
-        <Typography align="center">
-          {getTimeFromDate(new Date(recording.start_time))}
-        </Typography>
+        <Stack
+          direction="row"
+          spacing={1}
+          alignItems="center"
+          justifyContent="space-between"
+        >
+          {recording.trigger_type === "motion" ? (
+            <Tooltip title="Motion Detection">
+              <Movement size={20} />
+            </Tooltip>
+          ) : recording.trigger_type === "object" ? (
+            <Tooltip title="Object Detection">
+              <CenterSquare size={20} />
+            </Tooltip>
+          ) : recording.trigger_type === "face_recognition" ? (
+            <Tooltip title="Face Recognition">
+              <FaceActivated size={20} />
+            </Tooltip>
+          ) : recording.trigger_type === "license_plate_recognition" ? (
+            <Tooltip title="License Plate Recognition">
+              <LicensePlateRecognitionIcon />
+            </Tooltip>
+          ) : null}
+          <Typography>
+            {getTimeStringFromDayjs(
+              getDayjsFromDateTimeString(recording.start_time),
+            )}
+          </Typography>
+        </Stack>
       </CardContent>
       <CardMedia>
         <LazyLoad
@@ -59,7 +95,7 @@ export default function RecordingCard({
             />
           }
         >
-          {getVideoElement(camera, recording, auth.enabled)}
+          {getVideoElement(camera, recording)}
         </LazyLoad>
       </CardMedia>
       {!user || user.role === "admin" || user.role === "write" ? (
@@ -68,6 +104,7 @@ export default function RecordingCard({
             <Tooltip title="Delete Recording">
               <MutationIconButton
                 mutation={deleteRecording}
+                color="error"
                 onClick={() => {
                   deleteRecording.mutate({
                     identifier: camera.identifier,
@@ -76,7 +113,7 @@ export default function RecordingCard({
                   });
                 }}
               >
-                <DeleteForeverIcon />
+                <TrashCan size={20} />
               </MutationIconButton>
             </Tooltip>
           </Stack>

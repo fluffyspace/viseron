@@ -1,9 +1,14 @@
-import Fade from "@mui/material/Fade";
+import Box from "@mui/material/Box";
+import CircularProgress from "@mui/material/CircularProgress";
 import { useTheme } from "@mui/material/styles";
-import dayjs from "dayjs";
-import utc from "dayjs/plugin/utc";
 import Hls, { LevelLoadedData } from "hls.js";
-import React, { useCallback, useContext, useEffect, useRef } from "react";
+import React, {
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { v4 as uuidv4 } from "uuid";
 import { useShallow } from "zustand/react/shallow";
 
@@ -13,15 +18,22 @@ import {
   useHlsStore,
   useReferencePlayerStore,
 } from "components/events/utils";
+import { HlsErrorOverlay } from "components/player/hlsplayer/HlsErrorOverlay";
+import {
+  cleanupHlsInstance,
+  createHlsInstance,
+  setupHlsErrorHandling,
+} from "components/player/hlsplayer/utils";
 import { useAuthContext } from "context/AuthContext";
 import { ViseronContext } from "context/ViseronContext";
 import { useFirstRender } from "hooks/UseFirstRender";
 import { BASE_PATH } from "lib/api/client";
 import { BLANK_IMAGE } from "lib/helpers";
-import { getToken } from "lib/tokens";
+import {
+  getDateStringFromDayjs,
+  getDayjsFromUnixTimestamp,
+} from "lib/helpers/dates";
 import * as types from "lib/types";
-
-dayjs.extend(utc);
 
 const loadSource = (
   hlsRef: React.MutableRefObject<Hls | null>,
@@ -37,7 +49,10 @@ const loadSource = (
   // context before the requested timestamp
   const startTimestamp = playingDate - 3600;
 
-  const source = `${BASE_PATH}/api/v1/hls/${camera.identifier}/index.m3u8?start_timestamp=${startTimestamp}&date=${dayjs(playingDate * 1000).format("YYYY-MM-DD")}`;
+  const source =
+    `${BASE_PATH}/api/v1/hls/${camera.identifier}/index.m3u8` +
+    `?start_timestamp=${startTimestamp}` +
+    `&date=${getDateStringFromDayjs(getDayjsFromUnixTimestamp(playingDate))}`;
   hlsClientIdRef.current = uuidv4();
   hlsRef.current.loadSource(source);
 };
@@ -131,26 +146,8 @@ const initializePlayer = (
     hlsRef.current = null;
   }
 
-  // Create a new hls instance
-  hlsRef.current = new Hls({
-    autoStartLoad: false,
-    maxBufferLength: 30, // 30 seconds of forward buffer
-    backBufferLength: 15, // 15 seconds of back buffer
-    liveSyncDurationCount: 1, // Start from the second last segment
-    maxStarvationDelay: 99999999, // Prevents auto seeking back on starvation
-    liveDurationInfinity: false, // Has to be false to seek backwards
-    async xhrSetup(xhr, _url) {
-      xhr.withCredentials = true;
-      if (auth.enabled) {
-        const token = await getToken();
-        if (token) {
-          xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
-          xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-        }
-      }
-      xhr.setRequestHeader("Hls-Client-Id", hlsClientIdRef.current);
-    },
-  });
+  // Create a new hls instance using shared factory
+  hlsRef.current = createHlsInstance(auth, hlsClientIdRef);
 
   if (videoRef.current) {
     hlsRef.current.attachMedia(videoRef.current);
@@ -164,18 +161,13 @@ const initializePlayer = (
     onMediaAttached(hlsRef, videoRef, initialProgramDateTime, playingDateRef);
   });
 
-  // Reset error state when a fragment is loaded
-  hlsRef.current.on(Hls.Events.FRAG_LOADED, () => {
-    setHlsRefsError(hlsRef, null);
-  });
-
-  // Make sure initialization is retried on error after a delay
-  const delayedInitialization = () => {
-    if (delayedInitializationTimeoutRef.current) {
-      return;
-    }
-
-    delayedInitializationTimeoutRef.current = setTimeout(() => {
+  // Setup error handling using shared utility
+  setupHlsErrorHandling(hlsRef.current, {
+    hlsRef,
+    setHlsRefsError,
+    delayedInitializationTimeoutRef,
+    delayedRecoveryTimeoutRef,
+    onReinitialize: () => {
       initializePlayer(
         hlsRef,
         hlsClientIdRef,
@@ -188,52 +180,7 @@ const initializePlayer = (
         delayedInitializationTimeoutRef,
         delayedRecoveryTimeoutRef,
       );
-      delayedInitializationTimeoutRef.current = undefined;
-    }, 5000);
-  };
-
-  const delayedRecovery = () => {
-    if (delayedRecoveryTimeoutRef.current) {
-      return;
-    }
-
-    delayedRecoveryTimeoutRef.current = setTimeout(() => {
-      hlsRef.current!.recoverMediaError();
-    }, 5000);
-  };
-
-  // Handle errors
-  hlsRef.current.on(Hls.Events.ERROR, (_event, data) => {
-    // Ignore some HLS errors:
-    // - FRAG_GAP: Natural since recordings are not necessarily continuous
-    // - BUFFER_STALLED_ERROR: Happens when too close to live edge, automatically stabilizezes itself
-    switch (data.details) {
-      case Hls.ErrorDetails.FRAG_GAP:
-      case Hls.ErrorDetails.BUFFER_STALLED_ERROR:
-        break;
-      default:
-        setHlsRefsError(hlsRef, data.error.message.slice(0, 200));
-        break;
-    }
-
-    if (data.fatal) {
-      switch (data.type) {
-        case Hls.ErrorTypes.NETWORK_ERROR:
-          if (data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR) {
-            delayedInitialization();
-          }
-          hlsRef.current!.startLoad();
-          break;
-
-        case Hls.ErrorTypes.MEDIA_ERROR:
-          delayedRecovery();
-          break;
-
-        default:
-          delayedInitialization();
-          break;
-      }
-    }
+    },
   });
 };
 
@@ -306,15 +253,12 @@ const useInitializePlayer = (
       );
     }
     return () => {
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        removeHlsRef(hlsRef);
-        hlsRef.current = null;
-      }
-      if (delayedInitializationTimeoutRef.current) {
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-        clearTimeout(delayedInitializationTimeoutRef.current);
-      }
+      cleanupHlsInstance(
+        hlsRef,
+        removeHlsRef,
+        delayedInitializationTimeoutRef,
+        delayedRecoveryTimeoutRef,
+      );
     };
     // Must disable this warning since we dont want to ever run this twice
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -409,6 +353,7 @@ export function HlsPlayer({ camera }: HlsPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsClientIdRef = useRef<string>(uuidv4());
   const initialProgramDateTime = useRef<number | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
 
   const { hlsRefError } = useHlsStore(
     useShallow((state) => ({
@@ -432,6 +377,29 @@ export function HlsPlayer({ camera }: HlsPlayerProps) {
     reInitPlayer,
   );
 
+  // Handle loading state
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return () => {};
+
+    const handleLoadStart = () => setIsLoading(true);
+    const handleCanPlay = () => setIsLoading(false);
+    const handleLoadedData = () => setIsLoading(false);
+    const handleError = () => setIsLoading(false);
+
+    video.addEventListener("loadstart", handleLoadStart);
+    video.addEventListener("canplay", handleCanPlay);
+    video.addEventListener("loadeddata", handleLoadedData);
+    video.addEventListener("error", handleError);
+
+    return () => {
+      video.removeEventListener("loadstart", handleLoadStart);
+      video.removeEventListener("canplay", handleCanPlay);
+      video.removeEventListener("loadeddata", handleLoadedData);
+      video.removeEventListener("error", handleError);
+    };
+  }, []);
+
   return (
     <div
       style={{
@@ -441,6 +409,7 @@ export function HlsPlayer({ camera }: HlsPlayerProps) {
         display: "flex",
       }}
     >
+      {/* Always render video-element */}
       <video
         ref={videoRef}
         poster={BLANK_IMAGE}
@@ -452,28 +421,34 @@ export function HlsPlayer({ camera }: HlsPlayerProps) {
         }}
         controls={false}
         playsInline
+        muted
       />
-      <Fade in={!!(hlsRef.current && hlsRefError)}>
-        <div
-          style={{
+
+      {/* Show loading indicator and when camera is connected */}
+      {isLoading && (
+        <Box
+          sx={{
             position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            textAlign: "center",
-            width: "100%",
-            height: "100%",
-            backgroundColor:
-              "rgba(0,0,0,0.65)" /* Black background with opacity */,
-            zIndex: 2,
+            backgroundColor: "rgba(0, 0, 0, 0.3)",
+            zIndex: 1,
             pointerEvents: "none",
-            userSelect: "none",
-            padding: "10px",
           }}
         >
-          {hlsRefError}
-        </div>
-      </Fade>
+          <CircularProgress enableTrackSlot />
+        </Box>
+      )}
+
+      {/* Show error overlay */}
+      {hlsRef.current && <HlsErrorOverlay error={hlsRefError} />}
     </div>
   );
 }
+
+export default HlsPlayer;

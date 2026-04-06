@@ -1,5 +1,9 @@
-import DeleteForeverIcon from "@mui/icons-material/DeleteForever";
-import VideoFileIcon from "@mui/icons-material/VideoFile";
+import {
+  CloudOffline,
+  FolderDetailsReference,
+  TrashCan,
+} from "@carbon/icons-react";
+import Box from "@mui/material/Box";
 import Card from "@mui/material/Card";
 import CardActions from "@mui/material/CardActions";
 import CardContent from "@mui/material/CardContent";
@@ -13,10 +17,17 @@ import LazyLoad from "react-lazyload";
 import { Link } from "react-router-dom";
 
 import MutationIconButton from "components/buttons/MutationIconButton";
+import { getVideoElement } from "components/player/utils";
 import VideoPlayerPlaceholder from "components/player/videoplayer/VideoPlayerPlaceholder";
 import { useAuthContext } from "context/AuthContext";
 import { useDeleteRecording } from "lib/api/recordings";
-import { getTimeFromDate, getVideoElement, objHasValues } from "lib/helpers";
+import { objHasValues } from "lib/helpers";
+import {
+  getDayjsFromDateString,
+  getDayjsFromDateTimeString,
+  getDisplayDateStringFromDayjs,
+  getTimeStringFromDayjs,
+} from "lib/helpers/dates";
 import * as types from "lib/types";
 
 interface RecordingCardDailyProps {
@@ -31,7 +42,7 @@ export default function RecordingCardDaily({
   recording,
 }: RecordingCardDailyProps) {
   const theme = useTheme();
-  const { auth, user } = useAuthContext();
+  const { user } = useAuthContext();
   const deleteRecording = useDeleteRecording();
 
   return (
@@ -50,16 +61,9 @@ export default function RecordingCardDaily({
       }
     >
       <CardContent>
-        <Typography variant="h5" align="center">
-          {date}
+        <Typography variant="h6">
+          {getDisplayDateStringFromDayjs(getDayjsFromDateString(date))}
         </Typography>
-        {objHasValues<types.Recording>(recording) ? (
-          <Typography align="center">{`Last recording: ${getTimeFromDate(
-            new Date(recording.start_time),
-          )}`}</Typography>
-        ) : (
-          <Typography align="center">No recordings found</Typography>
-        )}
       </CardContent>
       <CardMedia>
         <LazyLoad
@@ -71,38 +75,82 @@ export default function RecordingCardDaily({
             />
           }
         >
-          {getVideoElement(camera, recording, auth.enabled)}
+          {objHasValues<types.Recording>(recording) ? (
+            getVideoElement(camera, recording)
+          ) : (
+            <Box
+              sx={{
+                width: "100%",
+                height: 200,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                backgroundColor: theme.palette.background.default,
+              }}
+            >
+              <CloudOffline
+                size={48}
+                style={{
+                  color: theme.palette.text.secondary,
+                  opacity: 0.5,
+                }}
+              />
+            </Box>
+          )}
         </LazyLoad>
       </CardMedia>
       <CardActions>
-        <Stack direction="row" spacing={1} sx={{ ml: "auto" }}>
-          <Tooltip title="View Recordings">
-            <span>
-              <IconButton
-                component={Link}
-                to={`/recordings/${camera.identifier}/${date}`}
-                disabled={!objHasValues(recording)}
-              >
-                <VideoFileIcon />
-              </IconButton>
-            </span>
-          </Tooltip>
-          {!user || user.role === "admin" || user.role === "write" ? (
-            <Tooltip title="Delete Recordings">
-              <MutationIconButton
-                mutation={deleteRecording}
-                onClick={() => {
-                  deleteRecording.mutate({
-                    identifier: camera.identifier,
-                    date,
-                    failed: camera.failed,
-                  });
-                }}
-              >
-                <DeleteForeverIcon />
-              </MutationIconButton>
+        <Stack
+          direction="row"
+          alignItems="center"
+          justifyContent="space-between"
+          spacing={2}
+          sx={{ width: "100%", paddingX: 1 }}
+        >
+          {objHasValues<types.Recording>(recording) ? (
+            <Typography variant="body2" sx={{ whiteSpace: "pre-line" }}>
+              Latest recording:{"\n"}
+              <span style={{ color: theme.palette.info.main }}>
+                {getTimeStringFromDayjs(
+                  getDayjsFromDateTimeString(recording.start_time),
+                )}
+              </span>
+            </Typography>
+          ) : (
+            <Typography variant="body2">No recordings found</Typography>
+          )}
+          <Stack direction="row" spacing={1}>
+            <Tooltip title="View All Videos">
+              <span>
+                <IconButton
+                  component={Link}
+                  to={`/recordings/${camera.identifier}/${date}`}
+                  disabled={!objHasValues(recording)}
+                >
+                  <FolderDetailsReference size={20} />
+                </IconButton>
+              </span>
             </Tooltip>
-          ) : null}
+            {!user || user.role === "admin" || user.role === "write" ? (
+              <Tooltip title="Delete All Videos">
+                <span>
+                  <MutationIconButton
+                    mutation={deleteRecording}
+                    color="error"
+                    onClick={() => {
+                      deleteRecording.mutate({
+                        identifier: camera.identifier,
+                        date,
+                        failed: camera.failed,
+                      });
+                    }}
+                  >
+                    <TrashCan size={20} />
+                  </MutationIconButton>
+                </span>
+              </Tooltip>
+            ) : null}
+          </Stack>
         </Stack>
       </CardActions>
     </Card>

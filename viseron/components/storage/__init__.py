@@ -6,14 +6,15 @@ import copy
 import logging
 import os
 import pathlib
-from collections.abc import Callable
+import time
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, overload
 
 import voluptuous as vol
 from alembic import command, script
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import update
+from sqlalchemy import text, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, scoped_session, sessionmaker
 
 from viseron.components.storage.config import (
@@ -70,19 +71,23 @@ from viseron.components.storage.util import (
 )
 from viseron.const import EVENT_DOMAIN_REGISTERED, VISERON_SIGNAL_STOPPING
 from viseron.domains.camera.const import CONFIG_STORAGE, DOMAIN as CAMERA_DOMAIN
+from viseron.exceptions import ComponentNotReady
 from viseron.helpers import utcnow
 from viseron.helpers.logs import StreamToLogger
 from viseron.helpers.validators import UNDEFINED
-from viseron.types import SnapshotDomain
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from viseron import Event, Viseron
     from viseron.components.storage.storage_subprocess import (
         DataItem,
         DataItemDeleteFile,
         DataItemMoveFile,
     )
+    from viseron.domain_registry import EventDomainRegisteredData
     from viseron.domains.camera import AbstractCamera
+    from viseron.viseron_types import SnapshotDomain
 
 LOGGER = logging.getLogger(__name__)
 
@@ -163,8 +168,43 @@ TIER_CATEGORIES: TierCategories = {
 }
 
 
+def _check_database_readiness(
+    engine, max_retries: int = 30, retry_interval: float = 1.0
+) -> bool:
+    """Check if database is ready for connections."""
+    for attempt in range(max_retries):
+        try:
+            with engine.connect() as conn:
+                # Try a simple query to verify database is ready
+                conn.execute(text("SELECT 1"))
+            LOGGER.info("Database connection established successfully")
+            return True
+        except OperationalError as error:
+            if attempt < max_retries - 1:
+                LOGGER.warning(
+                    "Database not ready (attempt %s/%s): %s. Retrying in %s seconds...",
+                    attempt + 1,
+                    max_retries,
+                    error,
+                    retry_interval,
+                )
+                time.sleep(retry_interval)
+            else:
+                LOGGER.error(
+                    "Database connection failed after %s attempts: %s",
+                    max_retries,
+                    error,
+                )
+                return False
+    return False
+
+
 def setup(vis: Viseron, config: dict[str, Any]) -> bool:
     """Set up storage component."""
+    # Check database readiness before initializing storage
+    if not _check_database_readiness(ENGINE):
+        raise ComponentNotReady("Database is not ready for connections")
+
     vis.data[COMPONENT] = Storage(vis, config[COMPONENT])
     vis.data[COMPONENT].initialize()
     return True
@@ -299,23 +339,52 @@ class Storage:
 
     def create_database(self) -> None:
         """Create database."""
-        conn = self.engine.connect()
-        context = MigrationContext.configure(conn)
-        current_rev = context.get_current_revision()
-        LOGGER.debug(f"Current database revision: {current_rev}")
+        max_retries = 5
+        retry_interval = 2.0
 
-        _script = script.ScriptDirectory.from_config(self._alembic_cfg)
+        for attempt in range(max_retries):
+            try:
+                conn = self.engine.connect()
+                context = MigrationContext.configure(conn)
+                current_rev = context.get_current_revision()
+                LOGGER.debug("Current database revision: %s", current_rev)
 
-        if current_rev is None:
-            self._create_new_db()
-        elif current_rev != _script.get_current_head():
-            self._run_migrations()
+                _script = script.ScriptDirectory.from_config(self._alembic_cfg)
 
-        self._get_session = scoped_session(sessionmaker(bind=self.engine))
-        self._get_session_expire = scoped_session(
-            sessionmaker(bind=self.engine, expire_on_commit=True)
-        )
-        startup_chores(self._get_session)
+                if current_rev is None:
+                    self._create_new_db()
+                elif current_rev != _script.get_current_head():
+                    self._run_migrations()
+
+                self._get_session = scoped_session(sessionmaker(bind=self.engine))
+                self._get_session_expire = scoped_session(
+                    sessionmaker(bind=self.engine, expire_on_commit=True)
+                )
+                startup_chores(self._get_session)
+                break  # Success, exit retry loop
+
+            except OperationalError as error:
+                if attempt < max_retries - 1:
+                    LOGGER.warning(
+                        "Database operation failed (attempt %s/%s): %s. "
+                        "Retrying in %s seconds...",
+                        attempt + 1,
+                        max_retries,
+                        error,
+                        retry_interval,
+                    )
+                    time.sleep(retry_interval)
+                    retry_interval *= 1.5  # Exponential backoff
+                else:
+                    LOGGER.error(
+                        "Database operations failed after %s attempts: %s",
+                        max_retries,
+                        error,
+                    )
+                    raise
+            except Exception:
+                LOGGER.exception("Unexpected error during database creation")
+                raise
 
     def get_session(self, expire_on_commit: bool = False) -> Session:
         """Get a new sqlalchemy session.
@@ -331,20 +400,17 @@ class Storage:
         return self._get_session()
 
     @overload
-    def get_event_clips_path(self, camera: AbstractCamera) -> str:
-        ...
+    def get_event_clips_path(self, camera: AbstractCamera) -> str: ...
 
     @overload
     def get_event_clips_path(
         self, camera: AbstractCamera, all_tiers: Literal[False]
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @overload
     def get_event_clips_path(
         self, camera: AbstractCamera, all_tiers: Literal[True]
-    ) -> list[str]:
-        ...
+    ) -> list[str]: ...
 
     def get_event_clips_path(
         self, camera: AbstractCamera, all_tiers: bool = False
@@ -368,20 +434,17 @@ class Storage:
         ]
 
     @overload
-    def get_segments_path(self, camera: AbstractCamera) -> str:
-        ...
+    def get_segments_path(self, camera: AbstractCamera) -> str: ...
 
     @overload
     def get_segments_path(
         self, camera: AbstractCamera, all_tiers: Literal[False]
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @overload
     def get_segments_path(
         self, camera: AbstractCamera, all_tiers: Literal[True]
-    ) -> list[str]:
-        ...
+    ) -> list[str]: ...
 
     def get_segments_path(
         self, camera: AbstractCamera, all_tiers: bool = False
@@ -403,20 +466,17 @@ class Storage:
         ]
 
     @overload
-    def get_thumbnails_path(self, camera: AbstractCamera) -> str:
-        ...
+    def get_thumbnails_path(self, camera: AbstractCamera) -> str: ...
 
     @overload
     def get_thumbnails_path(
         self, camera: AbstractCamera, all_tiers: Literal[False]
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @overload
     def get_thumbnails_path(
         self, camera: AbstractCamera, all_tiers: Literal[True]
-    ) -> list[str]:
-        ...
+    ) -> list[str]: ...
 
     def get_thumbnails_path(
         self, camera: AbstractCamera, all_tiers: bool = False
@@ -443,20 +503,19 @@ class Storage:
         ]
 
     @overload
-    def get_snapshots_path(self, camera: AbstractCamera, domain: SnapshotDomain) -> str:
-        ...
+    def get_snapshots_path(
+        self, camera: AbstractCamera, domain: SnapshotDomain
+    ) -> str: ...
 
     @overload
     def get_snapshots_path(
         self, camera: AbstractCamera, domain: SnapshotDomain, all_tiers: Literal[False]
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @overload
     def get_snapshots_path(
         self, camera: AbstractCamera, domain: SnapshotDomain, all_tiers: Literal[True]
-    ) -> list[str]:
-        ...
+    ) -> list[str]: ...
 
     def get_snapshots_path(
         self, camera: AbstractCamera, domain: SnapshotDomain, all_tiers: bool = False
@@ -479,20 +538,17 @@ class Storage:
         ]
 
     @overload
-    def get_timelapse_path(self, camera: AbstractCamera) -> str | None:
-        ...
+    def get_timelapse_path(self, camera: AbstractCamera) -> str | None: ...
 
     @overload
     def get_timelapse_path(
         self, camera: AbstractCamera, all_tiers: Literal[False]
-    ) -> str | None:
-        ...
+    ) -> str | None: ...
 
     @overload
     def get_timelapse_path(
         self, camera: AbstractCamera, all_tiers: Literal[True]
-    ) -> list[str] | None:
-        ...
+    ) -> list[str] | None: ...
 
     def get_timelapse_path(
         self, camera: AbstractCamera, all_tiers: bool = False
@@ -548,8 +604,10 @@ class Storage:
         if filename not in self.ignored_files:
             self.ignored_files.append(filename)
 
-    def _camera_registered(self, event_data: Event[AbstractCamera]) -> None:
-        camera = event_data.data
+    def _camera_registered(
+        self, event_data: Event[EventDomainRegisteredData[AbstractCamera]]
+    ) -> None:
+        camera = event_data.data.instance
         self.create_tier_handlers(camera)
 
     def create_tier_handlers(self, camera: AbstractCamera) -> None:
@@ -607,24 +665,21 @@ class Storage:
         self,
         item: DataItem,
         callback: Callable[[DataItem], None] | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     def tier_check_worker_send_command(
         self,
         item: DataItemMoveFile,
         callback: Callable[[DataItemMoveFile], None] | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     def tier_check_worker_send_command(
         self,
         item: DataItemDeleteFile,
         callback: Callable[[DataItemDeleteFile], None] | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     def tier_check_worker_send_command(
         self,

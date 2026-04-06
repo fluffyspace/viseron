@@ -5,9 +5,11 @@ import Cookies from "js-cookie";
 import {
   createContext,
   useContext,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
+  useState,
 } from "react";
 import { Link, Navigate, useLocation } from "react-router-dom";
 
@@ -17,7 +19,17 @@ import { Loading } from "components/loading/Loading";
 import { useToast } from "hooks/UseToast";
 import { useAuthEnabled, useAuthUser } from "lib/api/auth";
 import { viseronAPI } from "lib/api/client";
-import { getToken } from "lib/tokens";
+import {
+  DATE_FORMAT,
+  dayjsSetDefaultTimezone,
+  getDayjs,
+  getDefaultTimeFormat,
+  getDefaultTimezone,
+  getDisplayDateFormat,
+  setDefaultDisplayDateFormat,
+  setDefaultTimeFormat,
+} from "lib/helpers/dates";
+import { getToken, isManualLogoutActive } from "lib/tokens";
 import * as types from "lib/types";
 
 function ErrorLoadingUser() {
@@ -41,9 +53,11 @@ function ErrorLoadingUser() {
 
 const useAuthAxiosInterceptor = (
   auth: types.AuthEnabledResponse | undefined,
+  user: types.AuthUserResponse | null,
 ) => {
   const toast = useToast();
   const requestInterceptorRef = useRef<number | undefined>(undefined);
+  const sessionErrorShownRef = useRef(false);
 
   useLayoutEffect(() => {
     if (requestInterceptorRef.current !== undefined) {
@@ -82,7 +96,14 @@ const useAuthAxiosInterceptor = (
         }
 
         if (!cookies.user) {
-          toast.error("Session expired, please log in again");
+          if (
+            !sessionErrorShownRef.current &&
+            !isManualLogoutActive() &&
+            user !== null
+          ) {
+            sessionErrorShownRef.current = true;
+            toast.error("Session expired, please log in again");
+          }
           throw new Error("Invalid session.");
         }
 
@@ -102,7 +123,26 @@ const useAuthAxiosInterceptor = (
         viseronAPI.interceptors.request.eject(requestInterceptorRef.current);
       }
     };
-  }, [auth, toast]);
+  }, [auth, toast, user]);
+};
+
+// Sync user cookie with state to trigger re-renders
+const useUserCookieSync = () => {
+  const [cookiesUser, setCookiesUser] = useState(Cookies.get("user"));
+
+  useEffect(() => {
+    const checkCookie = () => {
+      const currentCookie = Cookies.get("user");
+      setCookiesUser(currentCookie);
+    };
+    checkCookie();
+
+    const interval = setInterval(checkCookie, 100);
+
+    return () => clearInterval(interval);
+  }, [setCookiesUser]);
+
+  return cookiesUser;
 };
 
 type AuthContextState = {
@@ -118,20 +158,21 @@ type AuthProviderProps = {
 
 export function AuthProvider({ children }: AuthProviderProps) {
   const authQuery = useAuthEnabled();
-  useAuthAxiosInterceptor(authQuery.data);
   const location = useLocation();
+  const cookiesUser = useUserCookieSync();
 
-  const cookies = Cookies.get();
   const userQuery = useAuthUser({
-    username: cookies.user,
+    username: cookiesUser || "",
     configOptions: {
       enabled: !!(
         authQuery.data?.enabled &&
         authQuery.data?.onboarding_complete &&
-        !!cookies.user
+        !!cookiesUser
       ),
     },
   });
+
+  useAuthAxiosInterceptor(authQuery.data, userQuery.data ?? null);
 
   const authContextState = useMemo<AuthContextState>(
     () => ({
@@ -155,11 +196,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }
 
   // isLoading instead of isPending because query might be disabled
-  if (userQuery.isLoading) {
+  // Skip loading screen during manual logout to avoid flash
+  if (userQuery.isLoading && !isManualLogoutActive()) {
     return <Loading text="Loading User" />;
   }
 
-  if (userQuery.isError) {
+  // Don't show error if we're on login page or if there's no cookie (user just logged out)
+  if (userQuery.isError && cookiesUser && location.pathname !== "/login") {
     return <ErrorLoadingUser />;
   }
 
@@ -178,6 +221,31 @@ export function AuthProvider({ children }: AuthProviderProps) {
         subtext="Auth context value is null"
       />
     );
+  }
+
+  // Set global timezone based on user preference
+  const userTimezone =
+    userQuery.data?.preferences?.timezone ??
+    Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (getDefaultTimezone() !== userTimezone) {
+    dayjsSetDefaultTimezone(userTimezone);
+    // Update api client UTC offset header
+    viseronAPI.defaults.headers.common["X-Client-UTC-Offset"] = getDayjs()
+      .utcOffset()
+      .toString();
+  }
+
+  // Set global date format based on user preference
+  const userDateFormat =
+    userQuery.data?.preferences?.date_format ?? DATE_FORMAT;
+  if (getDisplayDateFormat() !== userDateFormat) {
+    setDefaultDisplayDateFormat(userDateFormat);
+  }
+
+  // Set global time format based on user preference
+  const userTimeFormat = userQuery.data?.preferences?.time_format ?? null;
+  if (getDefaultTimeFormat() !== userTimeFormat) {
+    setDefaultTimeFormat(userTimeFormat);
   }
 
   return (

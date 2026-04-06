@@ -20,11 +20,11 @@ import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import { DateTimePicker } from "@mui/x-date-pickers/DateTimePicker";
 import { Dayjs } from "dayjs";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { useFilteredCameras } from "components/camera/useCameraStore";
 import { useCreateTestClip } from "lib/api/tests";
-import { is12HourFormat } from "lib/helpers";
+import { is12HourFormat } from "lib/helpers/dates";
 import * as types from "lib/types";
 
 type UseForTestDialogProps = {
@@ -32,6 +32,7 @@ type UseForTestDialogProps = {
   setOpen: (open: boolean) => void;
   initialStart?: Dayjs | null;
   initialEnd?: Dayjs | null;
+  initialCamera?: string;
 };
 
 type Kind = "motion" | "object";
@@ -64,12 +65,15 @@ export function UseForTestDialog({
   setOpen,
   initialStart,
   initialEnd,
+  initialCamera,
 }: UseForTestDialogProps) {
   const [startDate, setStartDate] = useState<Dayjs | null>(
     initialStart || null,
   );
   const [endDate, setEndDate] = useState<Dayjs | null>(initialEnd || null);
-  const [cameraIdentifier, setCameraIdentifier] = useState<string>("");
+  const [cameraIdentifier, setCameraIdentifier] = useState<string>(
+    initialCamera || "",
+  );
   const [name, setName] = useState<string>("");
   const [kind, setKind] = useState<Kind>("object");
   const [polarity, setPolarity] = useState<Polarity>("positive");
@@ -83,12 +87,11 @@ export function UseForTestDialog({
     [filteredCameras],
   );
 
-  // Default camera to the first selected one when the dialog opens.
-  useEffect(() => {
-    if (open && !cameraIdentifier && cameraOptions.length > 0) {
-      setCameraIdentifier(cameraOptions[0]);
-    }
-  }, [open, cameraIdentifier, cameraOptions]);
+  // Default camera to the first selected one while the user hasn't
+  // explicitly picked another. Derived during render instead of synced
+  // via an effect to avoid cascading re-renders.
+  const effectiveCameraIdentifier =
+    cameraIdentifier || cameraOptions[0] || "";
 
   const handleClose = () => {
     setOpen(false);
@@ -97,9 +100,9 @@ export function UseForTestDialog({
   };
 
   const handleSubmit = () => {
-    if (!startDate || !endDate || !cameraIdentifier || !name.trim()) return;
+    if (!startDate || !endDate || !effectiveCameraIdentifier || !name.trim()) return;
     const payload: types.TestClipCreateRequest = {
-      camera_identifier: cameraIdentifier,
+      camera_identifier: effectiveCameraIdentifier,
       start: startDate.unix(),
       end: endDate.unix(),
       name: name.trim(),
@@ -126,10 +129,11 @@ export function UseForTestDialog({
   const disabled =
     !startDate ||
     !endDate ||
-    !cameraIdentifier ||
+    !effectiveCameraIdentifier ||
     !name.trim() ||
     endDate.isBefore(startDate) ||
-    createClip.isPending;
+    createClip.isPending ||
+    createClip.isSuccess;
 
   return (
     <Dialog fullWidth maxWidth="sm" open={open} onClose={handleClose}>
@@ -149,7 +153,7 @@ export function UseForTestDialog({
             <InputLabel>Camera</InputLabel>
             <Select
               label="Camera"
-              value={cameraIdentifier}
+              value={effectiveCameraIdentifier}
               onChange={(event: SelectChangeEvent) =>
                 setCameraIdentifier(event.target.value)
               }
@@ -253,7 +257,7 @@ export function UseForTestDialog({
                 the <strong>Tests</strong> page and click{" "}
                 <em>Restart Viseron</em> to make the case runnable. The YAML
                 snippet below is only needed if you prefer declaring cases
-                manually in <code>config.yaml</code>:
+                manually in <code>tests.yaml</code>:
               </Alert>
               <Stack
                 direction="row"

@@ -99,50 +99,62 @@ def _yaml_snippet(
     expected: dict[str, Any],
     duration: int,
 ) -> str:
-    """Render a ready-to-paste YAML snippet for config.yaml.
+    """Render a ready-to-paste tests.yaml snippet.
 
-    The snippet declares the ffmpeg test-mode camera that will play the
-    clip back through the pipeline plus the ``test_runner`` case that
-    asserts on it.
+    Snippets are grouped the same way as tests.yaml itself — by real
+    camera, then by kind/polarity — so the user can paste them straight
+    into their file and merge adjacent blocks if they already have
+    entries for the same camera. The synthetic ffmpeg camera is no
+    longer the user's problem: ``test_runner`` auto-synthesizes one per
+    case at setup time.
     """
-    test_camera_id = f"test_{camera_identifier}_{slug}"
+    # ``slug`` / ``duration`` stay in the signature for wire compatibility
+    # with the REST response payload (frontend consumers expect them) but
+    # aren't needed in the tests.yaml snippet itself.
+    del slug, duration
 
-    def _format_expected() -> str:
-        lines = []
-        for key, value in expected.items():
-            if isinstance(value, list):
-                joined = ", ".join(repr(v) for v in value)
-                lines.append(f"          {key}: [{joined}]")
-            elif isinstance(value, bool):
-                lines.append(f"          {key}: {'true' if value else 'false'}")
-            else:
-                lines.append(f"          {key}: {value}")
-        return "\n".join(lines) or "          detected: true"
+    if kind == "motion":
+        return (
+            f"# Append under cameras.{camera_identifier}.motion.{polarity} in "
+            f"tests.yaml:\n"
+            f"cameras:\n"
+            f"  {camera_identifier}:\n"
+            f"    motion:\n"
+            f"      {polarity}:\n"
+            f"        - {clip_path}  # {name}\n"
+        )
 
+    # kind == "object"
+    if polarity == "negative":
+        return (
+            f"# Append under cameras.{camera_identifier}.object.negative in "
+            f"tests.yaml:\n"
+            f"cameras:\n"
+            f"  {camera_identifier}:\n"
+            f"    object:\n"
+            f"      negative:\n"
+            f"        - {clip_path}  # {name}\n"
+        )
+
+    # object / positive — group by label (fall back to "any" when no
+    # specific label was requested).
+    labels = expected.get("labels") or []
+    if not labels:
+        labels = ["any"]
+    label_blocks: list[str] = []
+    for label in labels:
+        label_blocks.append(
+            f"        {label}:\n"
+            f"          - {clip_path}  # {name}\n"
+        )
     return (
-        f"# Add to the ffmpeg camera component:\n"
-        f"ffmpeg:\n"
-        f"  camera:\n"
-        f"    {test_camera_id}:\n"
-        f"      name: Test {camera_identifier} — {name}\n"
-        f"      host: localhost\n"
-        f"      port: 554\n"
-        f"      path: /\n"
-        f"      test_mode: true\n"
-        f"      file_source: {clip_path}\n"
-        f"      # motion_detector: copy from '{camera_identifier}'\n"
-        f"      # object_detector: copy from '{camera_identifier}'\n"
-        f"\n"
-        f"# Add to the test_runner component:\n"
-        f"test_runner:\n"
-        f"  cases:\n"
-        f"    - name: {name}\n"
-        f"      camera: {test_camera_id}\n"
-        f"      kind: {kind}\n"
-        f"      duration: {duration}\n"
-        f"      video_path: {clip_path}\n"
-        f"      expected:\n"
-        f"{_format_expected()}\n"
+        f"# Append under cameras.{camera_identifier}.object.positive in "
+        f"tests.yaml:\n"
+        f"cameras:\n"
+        f"  {camera_identifier}:\n"
+        f"    object:\n"
+        f"      positive:\n"
+        + "".join(label_blocks)
     )
 
 
@@ -771,6 +783,15 @@ class TestsAPIHandler(BaseAPIHandler):
             return
 
         clip_path, effective_duration, case_id = result
+
+        # Register the synthetic camera at runtime so the case is
+        # immediately runnable without a Viseron restart.
+        component: "TestRunnerComponent | None" = self._vis.data.get(
+            TEST_RUNNER_COMPONENT
+        )
+        if component is not None:
+            await self.run_in_executor(component.refresh_db_cases)
+
         snippet = _yaml_snippet(
             camera_identifier=body["camera_identifier"],
             kind=body["kind"],

@@ -1,5 +1,4 @@
-import CircleIcon from "@mui/icons-material/Circle";
-import VideocamOffIcon from "@mui/icons-material/VideocamOff";
+import { CircleFill, VideoOff } from "@carbon/icons-react";
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
 import { SxProps, Theme } from "@mui/material/styles";
@@ -14,7 +13,7 @@ type CameraNameOverlayProps = {
 
 const overlayStyles: SxProps<Theme> = {
   position: "absolute",
-  zIndex: 1,
+  zIndex: 3,
   right: "0px",
   top: "0px",
   margin: "5px",
@@ -28,17 +27,27 @@ const cameraNameStyles: SxProps<Theme> = {
   color: "white",
 };
 
-const iconStyles: SxProps<Theme> = {
-  width: "12px",
-  height: "12px",
-  marginLeft: 1,
-};
-
 function StatusIcon({ camera }: { camera: types.Camera }) {
   return camera.is_on ? (
-    <CircleIcon htmlColor={camera.connected ? "red" : "gray"} sx={iconStyles} />
+    <CircleFill
+      size={12}
+      style={{
+        color: camera.is_recording
+          ? "red"
+          : camera.connected
+            ? "green"
+            : "gray",
+        marginLeft: "4px",
+      }}
+    />
   ) : (
-    <VideocamOffIcon htmlColor="white" sx={iconStyles} />
+    <VideoOff
+      size={12}
+      style={{
+        color: "white",
+        marginLeft: "4px",
+      }}
+    />
   );
 }
 
@@ -52,9 +61,18 @@ export function CameraNameOverlay({
   }
   const camera = cameraQuery.data;
 
-  const showStatusText = !camera.failed && (!camera.is_on || !camera.connected);
-  const statusText =
-    !camera.failed && camera.is_on ? "Disconnected" : "Camera is off";
+  let statusText = null;
+  if (camera.failed) {
+    statusText = "Camera error";
+  } else if (camera.is_recording) {
+    statusText = "Recording";
+  } else if (!camera.is_on) {
+    statusText = "Camera is off";
+  } else if (!camera.connected) {
+    statusText = "Disconnected";
+  } else {
+    statusText = null;
+  }
 
   return (
     <Box sx={overlayStyles}>
@@ -70,7 +88,7 @@ export function CameraNameOverlay({
         </Typography>
         {!camera.failed && <StatusIcon camera={camera as types.Camera} />}
       </Box>
-      {showStatusText && (
+      {statusText && (
         <Typography
           variant="body2"
           sx={{ ...cameraNameStyles, fontSize: "0.7rem", textAlign: "right" }}
