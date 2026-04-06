@@ -495,3 +495,49 @@ export type TestCase = {
 export type TestCasesListResponse = {
   cases: TestCase[];
 };
+
+export type AutoTuneAdjustment = {
+  source_camera: string;
+  domain: string;
+  component: string;
+  param_path: string[];
+  old_value: number;
+  new_value: number;
+  reason: string;
+};
+
+export type AutoTuneIteration = {
+  iteration: number;
+  run_id: number | null;
+  total: number;
+  passed: number;
+  failed: number;
+  status: "improved" | "no_change" | "complete" | "error" | string;
+  message: string;
+  adjustments: AutoTuneAdjustment[];
+};
+
+export type AutoTuneState = {
+  status:
+    | "running"
+    | "complete"
+    | "error"
+    | "cancelled"
+    | "restarting"
+    | string;
+  message: string;
+  max_iterations: number;
+  current_iteration: number;
+  started_at: number;
+  finished_at: number | null;
+  iterations: AutoTuneIteration[];
+};
+
+export type AutoTuneResponse = {
+  auto_tune: AutoTuneState | null;
+};
+
+export type AutoTuneStartResponse = {
+  started: boolean;
+  max_iterations: number;
+};

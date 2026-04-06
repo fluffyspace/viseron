@@ -12,6 +12,7 @@ import * as types from "lib/types";
 const RUNS_KEY = ["tests", "runs"] as const;
 const LATEST_KEY = ["tests", "runs", "latest"] as const;
 const CASES_KEY = ["tests", "cases"] as const;
+const AUTO_TUNE_KEY = ["tests", "auto-tune"] as const;
 
 /** Absolute URL that streams the clip bytes for a given test result. */
 export function testResultClipUrl(resultId: number): string {
@@ -81,6 +82,30 @@ async function deleteCase(caseId: number): Promise<{ deleted: number }> {
 async function postRestart(): Promise<{ restarting: boolean }> {
   const response = await viseronAPI.post<{ restarting: boolean }>(
     "tests/restart",
+  );
+  return response.data;
+}
+
+async function fetchAutoTune(): Promise<types.AutoTuneResponse> {
+  const response = await viseronAPI.get<types.AutoTuneResponse>(
+    "tests/auto-tune",
+  );
+  return response.data;
+}
+
+async function postAutoTune(
+  maxIterations = 10,
+): Promise<types.AutoTuneStartResponse> {
+  const response = await viseronAPI.post<types.AutoTuneStartResponse>(
+    "tests/auto-tune",
+    { max_iterations: maxIterations },
+  );
+  return response.data;
+}
+
+async function postCancelAutoTune(): Promise<{ cancelled: boolean }> {
+  const response = await viseronAPI.post<{ cancelled: boolean }>(
+    "tests/auto-tune/cancel",
   );
   return response.data;
 }
@@ -177,5 +202,46 @@ export function useRestartViseron(): UseMutationResult<
 > {
   return useMutation({
     mutationFn: postRestart,
+  });
+}
+
+export function useAutoTuneState(): UseQueryResult<
+  types.AutoTuneResponse,
+  types.APIErrorResponse
+> {
+  return useQuery({
+    queryKey: AUTO_TUNE_KEY,
+    queryFn: fetchAutoTune,
+    refetchInterval: 3000,
+  });
+}
+
+export function useStartAutoTune(): UseMutationResult<
+  types.AutoTuneStartResponse,
+  types.APIErrorResponse,
+  number | undefined
+> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (maxIterations?: number) => postAutoTune(maxIterations),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: AUTO_TUNE_KEY });
+      await queryClient.invalidateQueries({ queryKey: RUNS_KEY });
+      await queryClient.invalidateQueries({ queryKey: LATEST_KEY });
+    },
+  });
+}
+
+export function useCancelAutoTune(): UseMutationResult<
+  { cancelled: boolean },
+  types.APIErrorResponse,
+  void
+> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: postCancelAutoTune,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: AUTO_TUNE_KEY });
+    },
   });
 }

@@ -18,6 +18,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from viseron.components.storage.models import TestCase, TestResult, TestRun
 from viseron.components.storage.queries import get_time_period_fragments
 from viseron.components.test_runner import COMPONENT as TEST_RUNNER_COMPONENT
+from viseron.components.test_runner.auto_tuner import AutoTuner
 from viseron.components.test_runner.const import KINDS
 from viseron.components.test_runner.runner import _synth_test_camera_id
 from viseron.components.webserver.api.handlers import BaseAPIHandler
@@ -303,6 +304,31 @@ class TestsAPIHandler(BaseAPIHandler):
             "path_pattern": r"/tests/restart",
             "supported_methods": ["POST"],
             "method": "post_restart",
+        },
+        {
+            "requires_role": [Role.ADMIN, Role.WRITE],
+            "path_pattern": r"/tests/auto-tune",
+            "supported_methods": ["POST"],
+            "method": "post_auto_tune",
+            "json_body_schema": vol.Schema(
+                {
+                    vol.Optional("max_iterations", default=10): vol.All(
+                        int, vol.Range(min=1, max=50)
+                    ),
+                }
+            ),
+        },
+        {
+            "requires_role": [Role.ADMIN, Role.READ, Role.WRITE],
+            "path_pattern": r"/tests/auto-tune",
+            "supported_methods": ["GET"],
+            "method": "get_auto_tune",
+        },
+        {
+            "requires_role": [Role.ADMIN, Role.WRITE],
+            "path_pattern": r"/tests/auto-tune/cancel",
+            "supported_methods": ["POST"],
+            "method": "post_cancel_auto_tune",
         },
     ]
 
@@ -751,6 +777,80 @@ class TestsAPIHandler(BaseAPIHandler):
         payload = await self.run_in_executor(_read_bytes)
         self.set_header("Content-Length", str(len(payload)))
         self.finish(payload)
+
+    # --- auto-tune ---
+
+    # Class-level storage for the active auto-tuner instance.
+    _auto_tuner: "AutoTuner | None" = None
+
+    async def post_auto_tune(self) -> None:
+        """Start an auto-tune session that iteratively adjusts detection
+        parameters to make tests pass."""
+        component: "TestRunnerComponent | None" = self._vis.data.get(
+            TEST_RUNNER_COMPONENT
+        )
+        if component is None:
+            self.response_error(
+                HTTPStatus.NOT_FOUND,
+                "test_runner component is not configured",
+            )
+            return
+        if component.is_running:
+            self.response_error(
+                HTTPStatus.CONFLICT,
+                "A test run is already in progress. Wait for it to finish.",
+            )
+            return
+        if (
+            TestsAPIHandler._auto_tuner is not None
+            and TestsAPIHandler._auto_tuner.state.status == "running"
+        ):
+            self.response_error(
+                HTTPStatus.CONFLICT,
+                "An auto-tune session is already running.",
+            )
+            return
+
+        body = self.json_body
+        max_iterations = body.get("max_iterations", 10)
+
+        tuner = AutoTuner(
+            self._vis,
+            component,
+            max_iterations=max_iterations,
+        )
+        TestsAPIHandler._auto_tuner = tuner
+        tuner.start()
+
+        await self.response_success(
+            status=HTTPStatus.ACCEPTED,
+            response={
+                "started": True,
+                "max_iterations": max_iterations,
+            },
+        )
+
+    async def get_auto_tune(self) -> None:
+        """Return current auto-tune session state."""
+        tuner = TestsAPIHandler._auto_tuner
+        if tuner is None:
+            await self.response_success(response={"auto_tune": None})
+            return
+        await self.response_success(
+            response={"auto_tune": tuner.state.serialize()}
+        )
+
+    async def post_cancel_auto_tune(self) -> None:
+        """Cancel a running auto-tune session."""
+        tuner = TestsAPIHandler._auto_tuner
+        if tuner is None or tuner.state.status != "running":
+            self.response_error(
+                HTTPStatus.NOT_FOUND,
+                "No active auto-tune session to cancel.",
+            )
+            return
+        tuner.cancel()
+        await self.response_success(response={"cancelled": True})
 
     async def post_clip(self) -> None:
         """Clip a range of recorded footage and stash it as a test fixture."""

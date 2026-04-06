@@ -149,6 +149,14 @@ export function UseForTestDialog({
             required.
           </Typography>
 
+          <Alert severity="info" variant="outlined" sx={{ fontSize: 13 }}>
+            <strong>Tip:</strong> Include 10-30 seconds of calm footage{" "}
+            <em>before</em> the event so the motion detector can build its
+            background model, plus 5-15 seconds <em>after</em> the event ends.
+            For best auto-tuning results, create both a positive (should
+            detect) and negative (should NOT detect) case for each camera.
+          </Alert>
+
           <FormControl fullWidth size="small">
             <InputLabel>Camera</InputLabel>
             <Select
