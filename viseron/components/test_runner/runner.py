@@ -19,9 +19,10 @@ from viseron.components.storage.models import (
     TestRun,
 )
 from viseron.const import LOADED
+from viseron.domain_registry import DomainState
 from viseron.domains.camera import AbstractCamera
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
-from viseron.domains import setup_domain, setup_domains
+from viseron.domains import RequireDomain, setup_domain, setup_domains
 from viseron.exceptions import DomainNotRegisteredError
 from viseron.helpers import utcnow
 
@@ -134,6 +135,116 @@ def _build_synthetic_camera(
     synth["test_mode"] = True
     synth["file_source"] = file_source
     return synth
+
+
+# --- detection / NVR config injection helpers --------------------------------
+
+_DETECTION_DOMAINS = ("motion_detector", "object_detector")
+
+
+def _inject_into_detection_configs(
+    config: dict[str, Any],
+    parent_camera_id: str,
+    test_camera_id: str,
+) -> None:
+    """Clone parent camera detection settings to the test camera.
+
+    Iterates every top-level component config looking for
+    ``<domain>.cameras.<parent_camera_id>`` entries under each detection
+    domain.  When found the entry is deep-copied so the test camera
+    inherits the same detector settings as the parent.
+    """
+    for component_config in config.values():
+        if not isinstance(component_config, dict):
+            continue
+        for domain_name in _DETECTION_DOMAINS:
+            domain_config = component_config.get(domain_name)
+            if not isinstance(domain_config, dict):
+                continue
+            cameras = domain_config.get("cameras")
+            if not isinstance(cameras, dict):
+                continue
+            if parent_camera_id in cameras and test_camera_id not in cameras:
+                cameras[test_camera_id] = copy.deepcopy(
+                    cameras[parent_camera_id]
+                )
+
+
+def _inject_into_nvr_config(
+    config: dict[str, Any],
+    test_camera_id: str,
+) -> None:
+    """Add test camera to NVR config if NVR is explicitly configured."""
+    nvr_config = config.get("nvr")
+    if isinstance(nvr_config, dict) and test_camera_id not in nvr_config:
+        nvr_config[test_camera_id] = None
+
+
+def _register_runtime_detection_domains(
+    vis: "Viseron",
+    parent_camera_id: str,
+    test_camera_id: str,
+) -> None:
+    """Register detection domains for a test camera at runtime.
+
+    Looks up the parent camera's loaded detection domain entries and
+    clones their per-camera config for the test camera, then queues the
+    domains for setup via :func:`setup_domain`.
+    """
+    registry = vis.domain_registry
+    for domain_name in _DETECTION_DOMAINS:
+        parent_entry = registry.get(domain_name, parent_camera_id)
+        if not parent_entry or parent_entry.state != DomainState.LOADED:
+            continue
+        if registry.get(domain_name, test_camera_id):
+            continue
+        # Add test camera to the component's cameras config dict so the
+        # domain setup function finds per-camera settings.
+        domain_config = parent_entry.config.get(domain_name, {})
+        cameras = domain_config.get("cameras", {})
+        if parent_camera_id in cameras and test_camera_id not in cameras:
+            cameras[test_camera_id] = copy.deepcopy(
+                cameras[parent_camera_id]
+            )
+        setup_domain(
+            vis,
+            parent_entry.component_name,
+            domain_name,
+            parent_entry.config,
+            identifier=test_camera_id,
+            require_domains=[
+                RequireDomain(domain=CAMERA_DOMAIN, identifier=test_camera_id)
+            ],
+        )
+
+
+def _register_runtime_nvr_domain(
+    vis: "Viseron",
+    test_camera_id: str,
+) -> None:
+    """Register an NVR domain for a test camera at runtime."""
+    from viseron.components.nvr import (
+        optional_domains as nvr_optional_domains,
+    )
+    from viseron.components.nvr.const import (
+        COMPONENT as NVR_COMPONENT_NAME,
+        DOMAIN as NVR_DOMAIN,
+    )
+
+    registry = vis.domain_registry
+    if registry.get(NVR_DOMAIN, test_camera_id):
+        return
+    setup_domain(
+        vis,
+        NVR_COMPONENT_NAME,
+        NVR_DOMAIN,
+        {test_camera_id: {}},
+        identifier=test_camera_id,
+        require_domains=[
+            RequireDomain(domain=CAMERA_DOMAIN, identifier=test_camera_id)
+        ],
+        optional_domains=nvr_optional_domains(test_camera_id),
+    )
 
 
 # --- tests.yaml driven injection -------------------------------------------
@@ -267,6 +378,8 @@ def inject_yaml_cases(
                 display_name=display_name,
                 file_source=resolved_path,
             )
+            _inject_into_detection_configs(config, parent_id, synth_id)
+            _inject_into_nvr_config(config, synth_id)
             LOGGER.info(
                 "test_runner: injected synthetic camera %r for case %r",
                 synth_id,
@@ -388,6 +501,10 @@ def inject_db_cases(
                 display_name=f"Test {row.camera_identifier} — {row.name}",
                 file_source=row.video_path,
             )
+            _inject_into_detection_configs(
+                config, row.camera_identifier, test_camera_id
+            )
+            _inject_into_nvr_config(config, test_camera_id)
             LOGGER.info(
                 "injected test camera %r for db case %r (target: %r)",
                 test_camera_id,
@@ -502,6 +619,12 @@ class TestRunnerComponent:
                     pruned,
                     identifier=test_camera_id,
                 )
+                # Also wire up detection and NVR so the camera is
+                # fully operational without a restart.
+                _register_runtime_detection_domains(
+                    self._vis, row.camera_identifier, test_camera_id
+                )
+                _register_runtime_nvr_domain(self._vis, test_camera_id)
                 new_cameras_injected = True
                 LOGGER.info(
                     "runtime-injected test camera %r for db case %r",
@@ -511,7 +634,7 @@ class TestRunnerComponent:
 
         self._db_cases = refreshed
 
-        # Set up any newly registered cameras
+        # Set up any newly registered domains (camera + detectors + NVR)
         if new_cameras_injected:
             setup_domains(self._vis)
 

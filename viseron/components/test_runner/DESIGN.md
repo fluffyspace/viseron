@@ -534,11 +534,11 @@ No YAML editing at any step.
 
 ## Known limitations / future work
 
-- **True zero-restart iteration.** New cases still need one restart
-  to become runnable. The alternative (runtime camera creation + NVR
-  pipeline wiring) was investigated in Slice D and judged too
-  invasive for this slice — NVR has no runtime wiring hook. Worth
-  revisiting if users complain about the restart.
+- **~~True zero-restart iteration.~~** Resolved: `refresh_db_cases()`
+  now registers detection and NVR domains at runtime in addition to
+  the camera domain. `inject_db_cases()` / `inject_yaml_cases()` also
+  inject into detection component and NVR configs at PRE_PARALLEL so
+  the full pipeline is wired on startup.
 - **Gstreamer support.** `inject_db_cases` only injects into the
   `ffmpeg` component. Users with gstreamer cameras can create cases
   but they're silently skipped with a warning.
