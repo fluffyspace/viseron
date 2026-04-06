@@ -235,12 +235,21 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
 
         return True
 
-    def _get_cameras(self) -> None | dict[str, AbstractCamera]:
+    def _get_cameras(
+        self, include_test_cameras: bool = False
+    ) -> None | dict[str, AbstractCamera]:
         """Get all registered camera instances."""
         try:
             cameras = self._vis.get_registered_identifiers(CAMERA_DOMAIN)
         except DomainNotRegisteredError:
             return None
+
+        if not include_test_cameras:
+            cameras = {
+                cam_id: cam
+                for cam_id, cam in cameras.items()
+                if not cam.is_test_camera
+            }
 
         if (
             not self.current_user

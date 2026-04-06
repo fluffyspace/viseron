@@ -40,9 +40,21 @@ The test system lets you:
    are tagged with `test_mode=true` so detections are stored in the DB with
    a `test` flag and never mix with live events.
 
-3. The runner waits for the observation window (longest clip duration), then
-   queries the `Motion` and `Objects` tables for test-flagged rows and
-   compares against expectations.
+3. **Test cameras are dormant at boot.** They are registered in the config
+   but the NVR does not start them. No ffmpeg processes, no frame readers,
+   and no memory consumed until a user explicitly triggers a test run.
+
+4. **Tests run sequentially, one source camera at a time.** The runner
+   groups cases by source camera, then for each group:
+   - Starts the test cameras (`camera.start_camera()`)
+   - Waits for the observation window (max duration of that group's cases)
+   - Evaluates the cases
+   - **Stops the cameras** (`camera.stop_camera()`), freeing all ffmpeg
+     processes and memory before moving to the next group
+
+5. After all groups finish, the runner queries the `Motion` and `Objects`
+   tables for test-flagged rows, compares against expectations, and
+   generates **parameter adjustment recommendations** from any failures.
 
 ### Database models
 
@@ -89,7 +101,6 @@ cameras:
         - /config/test_videos/front_porch/object/negative/tree_shadows.mp4
 
 settings:
-  auto_start: false
   default_duration: 15
   camera_ready_timeout: 60
 ```
@@ -131,9 +142,22 @@ scene returned to normal.
 
 ### From the UI
 
-Go to `/#/tests` and click **Run tests**. The page auto-refreshes every 5
-seconds while a run is in flight. Results show pass/fail per case with
-expandable details (snapshot, video, expected vs actual JSON).
+Go to `/#/tests` and click **Run tests**. The page shows sequential
+progress — which camera group is currently running, pending, or done.
+Results show pass/fail per case with expandable details (snapshot, video,
+expected vs actual JSON).
+
+After a run with failures, a **Recommendations** panel appears showing
+suggested parameter adjustments (thresholds, confidence, etc.).
+
+#### Auto-correct mode
+
+Check the **Auto-correct** checkbox before clicking "Run tests" to
+automatically apply recommended parameter changes and re-run. Set
+**Max repetitions** to limit how many correction cycles to attempt
+(default 3). Each cycle applies adjustments to `config.yaml` and
+restarts Viseron so the new parameters take effect. Tests always run
+one camera group at a time to minimize memory usage.
 
 ### From the REST API
 
@@ -141,36 +165,25 @@ expandable details (snapshot, video, expected vs actual JSON).
 # Trigger a run
 curl -X POST http://localhost:8888/api/v1/tests/runs
 
-# Poll for results
+# Trigger with auto-correct (max 5 repetitions)
+curl -X POST http://localhost:8888/api/v1/tests/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"auto_correct": true, "max_repetitions": 5}'
+
+# Poll for results (includes progress and recommendations)
 curl http://localhost:8888/api/v1/tests/runs/latest
 
 # List all runs
 curl http://localhost:8888/api/v1/tests/runs?limit=20
 ```
 
-### Auto-start
-
-Set `auto_start: true` in `tests.yaml` or the `test_runner` config block
-to trigger a run automatically when Viseron starts. Combine with
-`shutdown_on_complete: true` for CI use.
-
 ---
 
-## Auto-tune
+## Auto-tune / Auto-correct
 
-The auto-tuner iteratively adjusts detection parameters to make failing
-tests pass.
-
-### How it works
-
-1. Runs all test cases with current config.
-2. Classifies each failure as **false negative** (missed detection) or
-   **false positive** (unwanted detection).
-3. Proposes parameter adjustments using binary-search stepping (bisects
-   toward the optimal boundary each iteration).
-4. Applies changes to `config.yaml`.
-5. Triggers a Viseron restart so the new config takes effect.
-6. After restart, re-trigger auto-tune to continue iterating.
+The auto-correct system iteratively adjusts detection parameters to make
+failing tests pass. It uses binary-search stepping (bisects toward the
+optimal boundary each iteration).
 
 ### What it adjusts
 
@@ -194,42 +207,14 @@ When positive and negative cases conflict on the same parameter (one wants
 to lower, the other wants to raise), the tuner averages the proposals as
 a compromise.
 
-### Using auto-tune
-
-**From the UI:**
-
-1. Go to `/#/tests`.
-2. In the **Auto-tune** card, set the max number of iterations (default 10).
-3. Click **Start auto-tune**.
-4. The system runs tests, shows progress with a per-iteration breakdown of
-   what parameters were changed and why.
-5. After each iteration that makes config changes, Viseron restarts. When it
-   comes back, go to the Tests page and start auto-tune again to continue.
-6. Auto-tune stops when all tests pass or no further adjustments can be proposed.
-
-**From the REST API:**
-
-```bash
-# Start auto-tune (max 10 iterations)
-curl -X POST http://localhost:8888/api/v1/tests/auto-tune \
-  -H 'Content-Type: application/json' \
-  -d '{"max_iterations": 10}'
-
-# Check progress
-curl http://localhost:8888/api/v1/tests/auto-tune
-
-# Cancel
-curl -X POST http://localhost:8888/api/v1/tests/auto-tune/cancel
-```
-
 ### Typical workflow
 
 1. Record a few events on your cameras (let Viseron run for a day or two).
 2. From the events timeline, create 2-4 test cases per camera: at least one
    positive (real event) and one negative (calm scene or hard negative).
-3. Run tests once to see which fail.
-4. Start auto-tune. 3-5 iterations usually suffice.
-5. After auto-tune completes, verify by running tests one more time.
+3. Run tests once to see which fail and review the recommendations.
+4. Enable **Auto-correct** and run again. 3-5 repetitions usually suffice.
+5. After auto-correct completes, verify by running tests one final time.
 
 ---
 
@@ -240,7 +225,7 @@ curl -X POST http://localhost:8888/api/v1/tests/auto-tune/cancel
 | `/tests/runs` | GET | List recent test runs |
 | `/tests/runs/latest` | GET | Latest run with results |
 | `/tests/runs/<id>` | GET | Specific run with results |
-| `/tests/runs` | POST | Trigger a new test run |
+| `/tests/runs` | POST | Trigger a new test run (accepts `auto_correct`, `max_repetitions`) |
 | `/tests/clips` | POST | Create test case from recorded footage |
 | `/tests/cases` | GET | List all catalogued test cases |
 | `/tests/cases/<id>` | DELETE | Delete a test case and its clip |
@@ -249,7 +234,7 @@ curl -X POST http://localhost:8888/api/v1/tests/auto-tune/cancel
 | `/tests/auto-tune` | POST | Start auto-tune session |
 | `/tests/auto-tune` | GET | Get auto-tune progress |
 | `/tests/auto-tune/cancel` | POST | Cancel running auto-tune |
-| `/tests/restart` | POST | Restart Viseron (admin only) |
+| `/tests/restart` | POST | Restart Viseron (admin only, legacy) |
 
 ---
 
@@ -259,11 +244,13 @@ curl -X POST http://localhost:8888/api/v1/tests/auto-tune/cancel
 
 ```yaml
 test_runner:
-  auto_start: false          # Trigger run on startup
   shutdown_on_complete: false # Exit after run (for CI)
   camera_ready_timeout: 60   # Seconds to wait for test cameras
   default_duration: 15       # Default observation window (seconds)
 ```
+
+Tests are always triggered manually (via UI or API). Test cameras are
+dormant at boot and only started when a run begins.
 
 ### tests.yaml
 
@@ -286,7 +273,6 @@ cameras:
         - /path/to/no_objects.mp4
 
 settings:
-  auto_start: false
   default_duration: 15
   camera_ready_timeout: 60
   shutdown_on_complete: false
