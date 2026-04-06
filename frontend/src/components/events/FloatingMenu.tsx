@@ -9,18 +9,49 @@ import { memo, useState } from "react";
 import { CameraPickerDialog } from "components/camera/CameraPickerDialog";
 import { DatePickerDialog } from "components/events/DatePickerDialog";
 import { ExportDialog } from "components/events/ExportDialog";
+import { useEventStore } from "components/events/utils";
 import { UseForTestDialog } from "components/tests/UseForTestDialog";
+import { getDayjsFromUnixTimestamp } from "lib/helpers/dates";
+import * as types from "lib/types";
 
 type FloatingMenuProps = {
   date: Dayjs;
   setDate: (date: Dayjs) => void;
 };
 
+function getEventTimes(event: types.CameraEvent | null) {
+  if (!event) return { start: null, end: null, camera: "" };
+  switch (event.type) {
+    case "motion":
+    case "recording":
+      return {
+        start: getDayjsFromUnixTimestamp(event.start_timestamp),
+        end: event.end_timestamp
+          ? getDayjsFromUnixTimestamp(event.end_timestamp)
+          : null,
+        camera: event.camera_identifier,
+      };
+    case "object":
+    case "face_recognition":
+    case "license_plate_recognition":
+      return {
+        start: getDayjsFromUnixTimestamp(event.timestamp),
+        end: null,
+        camera: event.camera_identifier,
+      };
+    default:
+      return { start: null, end: null, camera: "" };
+  }
+}
+
 export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
   const [cameraDialogOpen, setCameraDialogOpen] = useState(false);
   const [dateDialogOpen, setDateDialogOpen] = useState(false);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [testDialogOpen, setTestDialogOpen] = useState(false);
+  const selectedEvent = useEventStore((state) => state.selectedEvent);
+
+  const eventTimes = getEventTimes(selectedEvent);
 
   return (
     <>
@@ -41,8 +72,12 @@ export const FloatingMenu = memo(({ date, setDate }: FloatingMenuProps) => {
       />
       <ExportDialog open={exportDialogOpen} setOpen={setExportDialogOpen} />
       <UseForTestDialog
+        key={selectedEvent?.id ?? "none"}
         open={testDialogOpen}
         setOpen={setTestDialogOpen}
+        initialStart={eventTimes.start}
+        initialEnd={eventTimes.end}
+        initialCamera={eventTimes.camera}
       />
       <Box sx={{ position: "absolute", bottom: 16, right: 24 }}>
 
