@@ -5,13 +5,14 @@ import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
 import Stack from "@mui/material/Stack";
 import { DateTimePicker } from "@mui/x-date-pickers/DateTimePicker";
-import dayjs, { Dayjs } from "dayjs";
+import { Dayjs } from "dayjs";
 import { useState } from "react";
 
 import { useFilteredCameras } from "components/camera/useCameraStore";
 import { useEventStore } from "components/events/utils";
 import { useExportTimespan } from "lib/commands";
 import { is12HourFormat } from "lib/helpers";
+import { getDayjsFromUnixTimestamp } from "lib/helpers/dates";
 import * as types from "lib/types";
 
 // Extract start/end timestamps (seconds) from a selected event for prefill.
@@ -43,10 +44,10 @@ function ExportDialogBody({ setOpen }: ExportDialogBodyProps) {
   const initialRange = selectedEvent ? getEventRange(selectedEvent) : null;
 
   const [startDate, setStartDate] = useState<Dayjs | null>(
-    initialRange ? dayjs.unix(initialRange.start) : null,
+    initialRange ? getDayjsFromUnixTimestamp(initialRange.start) : null,
   );
   const [endDate, setEndDate] = useState<Dayjs | null>(
-    initialRange ? dayjs.unix(initialRange.end) : null,
+    initialRange ? getDayjsFromUnixTimestamp(initialRange.end) : null,
   );
 
   const filteredCameras = useFilteredCameras();
