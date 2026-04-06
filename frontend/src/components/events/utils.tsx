@@ -36,13 +36,18 @@ export const LIVE_EDGE_DELAY = 10;
 
 export const playerCardSmMaxHeight = () => window.innerHeight * 0.5;
 
-// Get all possible keys from Filters
+// Get all possible keys from Filters (excluding objectLabels which has its own toggle)
 export type FilterKeysFromFilters =
   | keyof Filters["eventTypes"]
-  | keyof Pick<Filters, Exclude<keyof Filters, "eventTypes">>;
+  | keyof Pick<Filters, Exclude<keyof Filters, "eventTypes" | "objectLabels">>;
 
 // Update FilterKey to use the mapped type
 type FilterKey = FilterKeysFromFilters;
+
+export type ObjectLabelFilter = {
+  label: string;
+  checked: boolean;
+};
 
 export type Filters = {
   eventTypes: {
@@ -51,9 +56,31 @@ export type Filters = {
       checked: boolean;
     };
   };
+  objectLabels: {
+    [normalizedLabel: string]: ObjectLabelFilter;
+  };
   groupCameras: { label: string; checked: boolean };
   lookbackAdjust: { label: string; checked: boolean };
 };
+
+// Normalize object labels so related detections share one filter toggle
+export const normalizeObjectLabel = (label: string): string => {
+  switch (label) {
+    case "car":
+    case "truck":
+    case "vehicle":
+      return "vehicle";
+    case "dog":
+    case "cat":
+    case "animal":
+      return "animal";
+    default:
+      return label;
+  }
+};
+
+const capitalizeLabel = (label: string): string =>
+  label.charAt(0).toUpperCase() + label.slice(1);
 
 const initialFilters: Filters = {
   eventTypes: {
@@ -66,6 +93,7 @@ const initialFilters: Filters = {
       checked: true,
     },
   },
+  objectLabels: {},
   groupCameras: { label: "Group Cameras", checked: false },
   lookbackAdjust: { label: "Adjust for Lookback", checked: true },
 };
@@ -74,6 +102,8 @@ interface FilterState {
   filters: Filters;
   setFilters: (filters: Filters) => void;
   toggleFilter: (filterKey: FilterKey) => void;
+  toggleObjectLabel: (normalizedLabel: string) => void;
+  updateObjectLabels: (labels: string[]) => void;
 }
 
 export const useFilterStore = create<FilterState>()(
@@ -112,8 +142,54 @@ export const useFilterStore = create<FilterState>()(
           return { filters: newFilters };
         });
       },
+      toggleObjectLabel: (normalizedLabel) => {
+        set((state) => {
+          const newObjectLabels = { ...state.filters.objectLabels };
+          if (normalizedLabel in newObjectLabels) {
+            newObjectLabels[normalizedLabel] = {
+              ...newObjectLabels[normalizedLabel],
+              checked: !newObjectLabels[normalizedLabel].checked,
+            };
+          }
+          return {
+            filters: { ...state.filters, objectLabels: newObjectLabels },
+          };
+        });
+      },
+      updateObjectLabels: (labels) => {
+        set((state) => {
+          const normalized = [
+            ...new Set(labels.map(normalizeObjectLabel)),
+          ];
+          let changed = false;
+          const newObjectLabels = { ...state.filters.objectLabels };
+          normalized.forEach((label) => {
+            if (!(label in newObjectLabels)) {
+              newObjectLabels[label] = {
+                label: capitalizeLabel(label),
+                checked: true,
+              };
+              changed = true;
+            }
+          });
+          if (!changed) return state;
+          return {
+            filters: { ...state.filters, objectLabels: newObjectLabels },
+          };
+        });
+      },
     }),
-    { name: "filter-store", version: 2 },
+    {
+      name: "filter-store",
+      version: 3,
+      migrate: (persistedState) => {
+        const state = persistedState as FilterState;
+        if (!state.filters.objectLabels) {
+          state.filters.objectLabels = {};
+        }
+        return state;
+      },
+    },
   ),
 );
 
@@ -439,6 +515,31 @@ const addSnapshotEvent = (
   };
 };
 
+// Check if an object event passes the label filter
+export const isObjectEventVisible = (
+  event: types.CameraObjectEvent,
+  filters: Filters,
+): boolean => {
+  const normalized = normalizeObjectLabel(event.label);
+  if (normalized in filters.objectLabels) {
+    return filters.objectLabels[normalized].checked;
+  }
+  // Labels not yet in the store are shown by default
+  return true;
+};
+
+// Filter events by type and (for objects) by label
+export const isEventVisible = (
+  event: types.CameraEvent,
+  filters: Filters,
+): boolean => {
+  if (!filters.eventTypes[event.type].checked) return false;
+  if (event.type === "object") {
+    return isObjectEventVisible(event, filters);
+  }
+  return true;
+};
+
 // Get the timeline items from the events and available timespans
 export const getTimelineItems = (
   startRef: React.MutableRefObject<number>,
@@ -448,8 +549,8 @@ export const getTimelineItems = (
 ) => {
   let timelineItems: TimelineItems = {};
 
-  const filteredEvents = eventsData.filter(
-    (event) => filters.eventTypes[event.type].checked,
+  const filteredEvents = eventsData.filter((event) =>
+    isEventVisible(event, filters),
   );
 
   // Loop over available HLS files

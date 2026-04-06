@@ -133,7 +133,24 @@ export const TimelineTable = memo(({ parentRef, date }: TimelineTableProps) => {
     eventsData.current = eventsQueries.data;
   }
 
-  const { filters } = useFilterStore();
+  const { filters, updateObjectLabels } = useFilterStore();
+
+  // Discover object labels from events and register them in the filter store
+  useEffect(() => {
+    if (eventsData.current) {
+      const labels = eventsData.current
+        .filter(
+          (e): e is types.CameraObjectEvent => e.type === "object",
+        )
+        .map((e) => e.label);
+      if (labels.length > 0) {
+        updateObjectLabels(labels);
+      }
+    }
+    // False positive, the ref is derived from the data
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eventsData.current, updateObjectLabels]);
+
   const timelineItems = useMemo(
     () =>
       getTimelineItems(

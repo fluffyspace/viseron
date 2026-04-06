@@ -40,7 +40,7 @@ const menuProps: MenuProps = {
 export function FilterMenu() {
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const open = Boolean(anchorEl);
-  const { filters, toggleFilter } = useFilterStore();
+  const { filters, toggleFilter, toggleObjectLabel } = useFilterStore();
 
   const handleClick = (event: MouseEvent<HTMLElement>) => {
     setAnchorEl(event.currentTarget);
@@ -56,6 +56,16 @@ export function FilterMenu() {
       event.preventDefault();
       toggleFilter(filterKey);
     };
+
+  const handleObjectLabelClick =
+    (label: string) => (event: MouseEvent<HTMLElement>) => {
+      event.stopPropagation();
+      event.preventDefault();
+      toggleObjectLabel(label);
+    };
+
+  const objectLabelKeys = Object.keys(filters.objectLabels);
+  const hasObjectLabels = objectLabelKeys.length > 0;
 
   return (
     <>
@@ -85,6 +95,51 @@ export function FilterMenu() {
           {Object.keys(filters.eventTypes).map((filterKey) => {
             const key = filterKey as types.CameraEvent["type"];
             const Icon = getIconFromType(key);
+
+            // "Object" gets a nested submenu when there are known labels
+            if (key === "object" && hasObjectLabels) {
+              return (
+                <NestedMenuItem
+                  key="object"
+                  leftIcon={<ChevronLeft size={20} />}
+                  rightIcon={<div />}
+                  renderLabel={() => (
+                    <>
+                      <Checkbox
+                        checked={filters.eventTypes.object.checked}
+                        onClick={handleCheckboxClick(key)}
+                      />
+                      <ListItemIcon>
+                        <Icon />
+                      </ListItemIcon>
+                      <ListItemText
+                        primary={filters.eventTypes.object.label}
+                      />
+                    </>
+                  )}
+                  onClick={handleCheckboxClick(key)}
+                  parentMenuOpen={open}
+                  MenuProps={menuProps}
+                >
+                  {objectLabelKeys.map((labelKey) => {
+                    const labelFilter = filters.objectLabels[labelKey];
+                    return (
+                      <MenuItem
+                        key={labelKey}
+                        onClick={handleObjectLabelClick(labelKey)}
+                      >
+                        <Checkbox
+                          checked={labelFilter.checked}
+                          onClick={handleObjectLabelClick(labelKey)}
+                        />
+                        <ListItemText primary={labelFilter.label} />
+                      </MenuItem>
+                    );
+                  })}
+                </NestedMenuItem>
+              );
+            }
+
             return (
               <MenuItem
                 key={filters.eventTypes[key].label}

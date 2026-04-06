@@ -1,12 +1,13 @@
 import Typography from "@mui/material/Typography";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Dayjs } from "dayjs";
-import { memo, useLayoutEffect, useMemo, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useState } from "react";
 
 import { useFilteredCameras } from "components/camera/useCameraStore";
 import { EventTableItem } from "components/events/events/EventTableItem";
 import {
   getEventTimestamp,
+  isEventVisible,
   useFilterStore,
   useTimespansRef,
 } from "components/events/utils";
@@ -31,8 +32,8 @@ const useGroupedEvents = (snapshotEvents: types.CameraEvent[]) => {
     let groupCameraIdentifier = snapshotEvents[0].camera_identifier;
 
     snapshotEvents.forEach((event) => {
-      // Filter out unwanted event types
-      if (!filters.eventTypes[event.type].checked) return;
+      // Filter out unwanted event types (and object sub-labels)
+      if (!isEventVisible(event, filters)) return;
 
       const currentTime = getEventTimestamp(event);
 
@@ -78,6 +79,21 @@ export const EventTable = memo(({ parentRef, date }: EventTableProps) => {
 
   // Subscribe to timespans so it updates for child components
   useTimespansRef(date);
+
+  // Discover object labels from events and register them in the filter store
+  const { updateObjectLabels } = useFilterStore();
+  useEffect(() => {
+    if (eventsQueries.data) {
+      const labels = eventsQueries.data
+        .filter(
+          (e): e is types.CameraObjectEvent => e.type === "object",
+        )
+        .map((e) => e.label);
+      if (labels.length > 0) {
+        updateObjectLabels(labels);
+      }
+    }
+  }, [eventsQueries.data, updateObjectLabels]);
 
   const groupedEvents = useGroupedEvents(eventsQueries.data || []);
 
