@@ -4,6 +4,7 @@ import datetime
 from sqlalchemy import update
 
 from viseron.components.storage.check_tier import (
+    FILES_COMPUTE_DTYPE,
     get_files_to_move,
     get_recordings_to_move,
     load_recordings,
@@ -36,11 +37,11 @@ class TestCheckTier(BaseTestWithRecordings):
         )
 
         assert len(files_to_move) == 8
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["id"] == 3
-        assert files_to_move[2]["id"] == 5
-        assert files_to_move[3]["id"] == 7
-        assert files_to_move[7]["id"] == 15
+        assert files_to_move[0] == 1
+        assert files_to_move[1] == 3
+        assert files_to_move[2] == 5
+        assert files_to_move[3] == 7
+        assert files_to_move[7] == 15
 
     def test_get_files_to_move_min_age(self) -> None:
         """Test get_files_to_move using max_bytes + min_age."""
@@ -62,8 +63,8 @@ class TestCheckTier(BaseTestWithRecordings):
         )
 
         assert len(files_to_move) == 2
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["id"] == 3
+        assert files_to_move[0] == 1
+        assert files_to_move[1] == 3
 
     def test_get_files_to_move_max_age(self) -> None:
         """Test get_files_to_move using max_age."""
@@ -84,10 +85,10 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
         assert len(files_to_move) == 6
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["id"] == 3
-        assert files_to_move[2]["id"] == 5
-        assert files_to_move[5]["id"] == 11
+        assert files_to_move[0] == 1
+        assert files_to_move[1] == 3
+        assert files_to_move[2] == 5
+        assert files_to_move[5] == 11
 
     def test_get_files_to_move_min_bytes(self) -> None:
         """Test get_files_to_move using max_age + min_bytes.
@@ -113,10 +114,10 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
         assert len(files_to_move) == 5
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["id"] == 3
-        assert files_to_move[2]["id"] == 5
-        assert files_to_move[4]["id"] == 9
+        assert files_to_move[0] == 1
+        assert files_to_move[1] == 3
+        assert files_to_move[2] == 5
+        assert files_to_move[4] == 9
 
     def test_get_files_to_move_max_bytes_and_age(self) -> None:
         """Test get_files_to_move using max_bytes + max_age.
@@ -143,10 +144,10 @@ class TestCheckTier(BaseTestWithRecordings):
         )
 
         assert len(files_to_move) == 9
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["id"] == 3
-        assert files_to_move[2]["id"] == 5
-        assert files_to_move[8]["id"] == 17
+        assert files_to_move[0] == 1
+        assert files_to_move[1] == 3
+        assert files_to_move[2] == 5
+        assert files_to_move[8] == 17
 
     def test_get_files_to_move_drain(self) -> None:
         """Test get_files_to_move using drain."""

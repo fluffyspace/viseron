@@ -11,10 +11,10 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
-from sqlalchemy import delete, select
+from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import scoped_session, sessionmaker
 
-from viseron.components.storage.const import ENGINE
+from viseron.components.storage.const import DATABASE_URL
 from viseron.components.storage.models import Files, Recordings
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.helpers import utcnow
@@ -30,13 +30,12 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-FILES_DTYPE = np.dtype(
+# Lightweight dtype for computation — no path strings, minimal memory
+FILES_COMPUTE_DTYPE = np.dtype(
     [
         ("id", np.int64),
         ("size", np.int64),
         ("orig_ctime", np.int64),
-        ("path", "U512"),
-        ("tier_path", "U512"),
     ]
 )
 
@@ -50,16 +49,37 @@ RECORDINGS_DTYPE = np.dtype(
     ]
 )
 
-RECORDINGS_FILES_DTYPE = np.dtype(
+# Lightweight dtype for recording-file associations — no paths
+RECORDINGS_FILES_COMPUTE_DTYPE = np.dtype(
     [
         ("recording_id", np.int64),
         ("id", np.int64),
         ("size", np.int64),
         ("orig_ctime", np.int64),
-        ("path", "U512"),
-        ("tier_path", "U512"),
     ]
 )
+
+# Result dtypes — only used for the small subset of files that need action
+FILES_RESULT_DTYPE = np.dtype(
+    [
+        ("id", np.int64),
+        ("path", "U256"),
+        ("tier_path", "U256"),
+    ]
+)
+
+RECORDINGS_RESULT_DTYPE = np.dtype(
+    [
+        ("recording_id", np.int64),
+        ("id", np.int64),
+        ("path", "U256"),
+        ("tier_path", "U256"),
+    ]
+)
+
+# Keep old names as aliases for backward compatibility with tests
+FILES_DTYPE = FILES_RESULT_DTYPE
+RECORDINGS_FILES_DTYPE = RECORDINGS_RESULT_DTYPE
 
 
 class Worker:
@@ -68,15 +88,23 @@ class Worker:
     def __init__(
         self,
     ) -> None:
+        # Create a subprocess-local engine with a small pool instead of
+        # importing the shared ENGINE (pool_size=10, max_overflow=90)
+        engine = create_engine(
+            DATABASE_URL,
+            connect_args={"options": "-c timezone=UTC"},
+            pool_size=2,
+            max_overflow=3,
+        )
         self._get_session: Callable[[], Session] = scoped_session(
-            sessionmaker(bind=ENGINE)
+            sessionmaker(bind=engine)
         )
         self._last_call: dict[str, float] = {}
         self._check_locks: dict[str, threading.Lock] = {}
         self._checks_in_progress: dict[str, bool] = {}
 
     def _check_tier(self, item: DataItem) -> None:
-        files = np.empty(0, dtype=FILES_DTYPE)
+        files = np.empty(0, dtype=FILES_RESULT_DTYPE)
         if item.cmd == "check_tier" and item.files_enabled:
             LOGGER.debug(
                 "Received check_tier command for files "
@@ -88,7 +116,7 @@ class Worker:
             )
             files = self.check_tier_files(item)
 
-        recordings = np.empty(0, dtype=RECORDINGS_DTYPE)
+        recordings = np.empty(0, dtype=RECORDINGS_RESULT_DTYPE)
         if item.cmd == "check_tier" and item.events_enabled:
             LOGGER.debug(
                 "Received check_tier command for recordings "
@@ -127,7 +155,7 @@ class Worker:
                     dtype=recordings.dtype if recordings.size > 0 else files.dtype,
                 )
         else:
-            item.data = np.empty(0, dtype=FILES_DTYPE)
+            item.data = np.empty(0, dtype=FILES_RESULT_DTYPE)
 
         LOGGER.debug(
             "Found %d files to move for %s tier %s category %s subcategory %s",
@@ -211,7 +239,7 @@ class Worker:
             item.error = str(e)
 
     def load_tier(self, item: DataItem):
-        """Load the tier data for the camera."""
+        """Load the tier data for the camera (lightweight, no paths)."""
         data = load_tier(
             self._get_session,
             item.category,
@@ -271,7 +299,7 @@ class Worker:
             max_age_timestamp,
         )
 
-        rows_to_move = get_files_to_move(
+        ids_to_move = get_files_to_move(
             data,
             item.max_bytes,
             min_age_timestamp,
@@ -280,7 +308,11 @@ class Worker:
             item.drain,
         )
 
-        return rows_to_move
+        if ids_to_move.size == 0:
+            return np.empty(0, dtype=FILES_RESULT_DTYPE)
+
+        # Resolve paths only for the files that need to be moved
+        return resolve_file_paths(self._get_session, ids_to_move)
 
     def check_tier_recordings(
         self,
@@ -341,7 +373,7 @@ class Worker:
             max_age_timestamp,
             file_min_age,
         )
-        rows_to_move = get_recordings_to_move(
+        ids_to_move = get_recordings_to_move(
             recordings_data,
             files_data,
             CAMERA_SEGMENT_DURATION,
@@ -353,7 +385,13 @@ class Worker:
             drain=item.drain,
         )
 
-        return rows_to_move
+        if ids_to_move.size == 0:
+            return np.empty(0, dtype=RECORDINGS_RESULT_DTYPE)
+
+        # Resolve paths only for the files that need action
+        return resolve_recording_file_paths(
+            self._get_session, ids_to_move
+        )
 
 
 def load_tier(
@@ -363,10 +401,10 @@ def load_tier(
     tier_id: int,
     camera_identifier: str,
 ):
-    """Load the tier files data for the camera."""
+    """Load the tier files data for the camera (lightweight, no paths)."""
     with get_session() as session:
         stmt = select(
-            Files.id, Files.size, Files.orig_ctime, Files.path, Files.tier_path
+            Files.id, Files.size, Files.orig_ctime,
         ).where(
             Files.camera_identifier == camera_identifier,
             Files.tier_id == tier_id,
@@ -379,14 +417,12 @@ def load_tier(
                 row.id,
                 row.size,
                 int(row.orig_ctime.timestamp()),
-                row.path,
-                row.tier_path,
             )
             for row in result
         ]
         return np.array(
             data,
-            dtype=FILES_DTYPE,
+            dtype=FILES_COMPUTE_DTYPE,
         )
 
 
@@ -423,6 +459,61 @@ def load_recordings(
     )
 
 
+def resolve_file_paths(
+    get_session: Callable[..., Session],
+    file_ids: np.ndarray,
+) -> np.ndarray:
+    """Fetch paths from DB for a small set of file IDs.
+
+    Returns FILES_RESULT_DTYPE array with (id, path, tier_path).
+    """
+    ids_list = file_ids.tolist()
+    with get_session() as session:
+        stmt = select(Files.id, Files.path, Files.tier_path).where(
+            Files.id.in_(ids_list),
+        )
+        rows = session.execute(stmt).all()
+
+    # Build lookup and preserve original order
+    path_map = {row.id: (row.path, row.tier_path) for row in rows}
+    data = [
+        (fid, path_map[fid][0], path_map[fid][1])
+        for fid in ids_list
+        if fid in path_map
+    ]
+    return np.array(data, dtype=FILES_RESULT_DTYPE)
+
+
+def resolve_recording_file_paths(
+    get_session: Callable[..., Session],
+    ids_to_move: np.ndarray,
+) -> np.ndarray:
+    """Fetch paths from DB for recording-file ID pairs.
+
+    Takes array with (recording_id, id) fields.
+    Returns RECORDINGS_RESULT_DTYPE array with (recording_id, id, path, tier_path).
+    Filters to only .m4s files.
+    """
+    file_ids_list = list(set(int(x) for x in ids_to_move["id"]))
+    with get_session() as session:
+        stmt = select(Files.id, Files.path, Files.tier_path).where(
+            Files.id.in_(file_ids_list),
+            Files.path.like("%.m4s"),
+        )
+        rows = session.execute(stmt).all()
+
+    path_map = {row.id: (row.path, row.tier_path) for row in rows}
+    data = [
+        (int(rec["recording_id"]), int(rec["id"]),
+         path_map[rec["id"]][0], path_map[rec["id"]][1])
+        for rec in ids_to_move
+        if int(rec["id"]) in path_map
+    ]
+    if not data:
+        return np.empty(0, dtype=RECORDINGS_RESULT_DTYPE)
+    return np.array(data, dtype=RECORDINGS_RESULT_DTYPE)
+
+
 def get_files_to_move(
     data: np.ndarray,
     max_bytes: int,
@@ -431,13 +522,15 @@ def get_files_to_move(
     max_age_timestamp: float,
     drain: bool,
 ):
-    """Get id of files to move.
+    """Get IDs of files to move.
 
     The processing is done in the following steps:
     1. First the array is sorted by the timestamp.
     2. np.cumsum is used to calculate the cumulative sum of the sizes.
     3. Any rows where the cumulative size exceeds the tier size are marked
         for moving to the next tier.
+
+    Returns a 1D array of file IDs.
     """
     # Sort by timestamp
     sorted_indices = np.argsort(data["orig_ctime"])
@@ -472,8 +565,8 @@ def get_files_to_move(
         if indices_to_move.size > 0:
             rows_to_move = data[indices_to_move]
 
-    stripped_rows = rows_to_move[["id", "path", "tier_path"]]
-    return stripped_rows[::-1]
+    # Return just the IDs, reversed
+    return rows_to_move["id"][::-1]
 
 
 def get_recordings_to_move(
@@ -487,7 +580,10 @@ def get_recordings_to_move(
     file_min_age_timestamp: float,
     drain: bool,
 ):
-    """Get files to move based on recording grouping."""
+    """Get file IDs to move based on recording grouping.
+
+    Returns array with (recording_id, id) fields.
+    """
     # Sort recordings by adjusted start time (descending)
     sorted_indices_recordings = np.argsort(recordings_data["adjusted_start_time"])[::-1]
     recordings_data = recordings_data[sorted_indices_recordings]
@@ -523,8 +619,6 @@ def get_recordings_to_move(
                         file_row["id"],
                         file_row["size"],
                         file_row["orig_ctime"],
-                        file_row["path"],
-                        file_row["tier_path"],
                     )
                 )
                 current_recording_total_size += file_row["size"]
@@ -542,20 +636,17 @@ def get_recordings_to_move(
                         file_row["id"],
                         file_row["size"],
                         file_row["orig_ctime"],
-                        file_row["path"],
-                        file_row["tier_path"],
                     )
                 )
 
     combined_files_list = associated_files_data_list + other_files_data_list
 
     if not combined_files_list:
-        return np.empty(0, dtype=RECORDINGS_FILES_DTYPE)
+        return np.empty(0, dtype=RECORDINGS_FILES_COMPUTE_DTYPE)
 
-    recordings_files = np.array(combined_files_list, dtype=RECORDINGS_FILES_DTYPE)
+    recordings_files = np.array(combined_files_list, dtype=RECORDINGS_FILES_COMPUTE_DTYPE)
 
     # Sort by id, then orig_ctime to ensure consistent unique selection if needed
-    # Although file IDs should be unique.
     recordings_files.sort(order=["id", "orig_ctime"])
 
     recording_cumulative_sizes = np.cumsum(recordings_size)
@@ -574,7 +665,7 @@ def get_recordings_to_move(
             & (recording_cumulative_sizes >= min_bytes)
         )[0]
 
-    files_to_move_np = np.empty(0, dtype=RECORDINGS_FILES_DTYPE)
+    files_to_move_np = np.empty(0, dtype=RECORDINGS_FILES_COMPUTE_DTYPE)
     if drain and (
         bytes_indices_to_move_recordings.size > 0
         or age_indices_to_move_recordings.size > 0
@@ -610,28 +701,22 @@ def get_recordings_to_move(
                     files_to_move_list.append(r_file)
 
         if not files_to_move_list:
-            return np.empty(0, dtype=RECORDINGS_FILES_DTYPE)
+            return np.empty(0, dtype=RECORDINGS_FILES_COMPUTE_DTYPE)
 
         # Convert list of structured array rows to a new array
-        files_to_move_np = np.array(files_to_move_list, dtype=RECORDINGS_FILES_DTYPE)
+        files_to_move_np = np.array(
+            files_to_move_list, dtype=RECORDINGS_FILES_COMPUTE_DTYPE
+        )
 
     # Ensure unique files by ID, taking the first occurrence after sorting
     if files_to_move_np.size > 0:
         _, unique_indices = np.unique(files_to_move_np["id"], return_index=True)
         files_to_move_np = files_to_move_np[unique_indices]
     else:
-        return np.empty(0, dtype=RECORDINGS_FILES_DTYPE)
+        return np.empty(0, dtype=RECORDINGS_FILES_COMPUTE_DTYPE)
 
-    # Strip to required columns
-    stripped_files_to_move = files_to_move_np[
-        ["recording_id", "id", "path", "tier_path"]
-    ]
-
-    # Remove any files that are not m4s
-    stripped_files_to_move = stripped_files_to_move[
-        np.char.endswith(stripped_files_to_move["path"], ".m4s")
-    ]
-    return stripped_files_to_move
+    # Return (recording_id, id) pairs — paths resolved later
+    return files_to_move_np[["recording_id", "id"]]
 
 
 def delete_file(
