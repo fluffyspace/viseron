@@ -118,6 +118,7 @@
 !/scripts
 !/scripts/*
 !/scripts/**
+scripts/deploy-lenovo.sh
 
 # Repo
 !/.codespellrc
