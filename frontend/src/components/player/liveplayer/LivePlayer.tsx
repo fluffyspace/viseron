@@ -360,7 +360,6 @@ export function LivePlayer({
             </Box>
           )}
       </div>
-      <video-stream ref={elementRef} style={style} controls={controlsVisible} />
       {overlay}
       <CameraNameOverlay
         camera_identifier={camera.identifier}

@@ -375,8 +375,6 @@ export function MjpegPlayer({
           </Box>
         )}
       </div>
-        draggable={false}
-      />
       {overlay}
       <CameraNameOverlay
         camera_identifier={camera.identifier}
