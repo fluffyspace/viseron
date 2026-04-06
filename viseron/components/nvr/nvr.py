@@ -410,7 +410,8 @@ class NVR(AbstractNVR):
             vis.register_signal_handler(VISERON_SIGNAL_SHUTDOWN, self.stop)
         )
 
-        self._camera.start_camera()
+        if not self._camera.is_test_camera:
+            self._camera.start_camera()
         self._logger.info(f"NVR for camera {self._camera.name} initialized")
 
     def __repr__(self) -> str:

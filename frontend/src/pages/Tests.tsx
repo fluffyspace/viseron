@@ -1,4 +1,3 @@
-import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import CancelIcon from "@mui/icons-material/Cancel";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
@@ -6,8 +5,7 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
-import RestartAltIcon from "@mui/icons-material/RestartAlt";
-import StopIcon from "@mui/icons-material/Stop";
+import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
 import Accordion from "@mui/material/Accordion";
 import AccordionDetails from "@mui/material/AccordionDetails";
 import AccordionSummary from "@mui/material/AccordionSummary";
@@ -16,13 +14,14 @@ import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import Card from "@mui/material/Card";
 import CardContent from "@mui/material/CardContent";
+import Checkbox from "@mui/material/Checkbox";
 import Chip from "@mui/material/Chip";
 import CircularProgress from "@mui/material/CircularProgress";
 import Collapse from "@mui/material/Collapse";
 import Container from "@mui/material/Container";
 import Divider from "@mui/material/Divider";
+import FormControlLabel from "@mui/material/FormControlLabel";
 import IconButton from "@mui/material/IconButton";
-import LinearProgress from "@mui/material/LinearProgress";
 import Paper from "@mui/material/Paper";
 import Stack from "@mui/material/Stack";
 import Table from "@mui/material/Table";
@@ -40,12 +39,8 @@ import { useTitle } from "hooks/UseTitle";
 import {
   testCaseClipUrl,
   testResultClipUrl,
-  useAutoTuneState,
-  useCancelAutoTune,
   useDeleteTestCase,
   useLatestTestRun,
-  useRestartViseron,
-  useStartAutoTune,
   useTestCases,
   useTestRunDetail,
   useTestRuns,
@@ -201,293 +196,108 @@ function GuidancePanel() {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-tune section
+// Sequential progress
 // ---------------------------------------------------------------------------
 
-function AutoTuneIterationRow({
-  iteration,
+function SequentialProgress({
+  progress,
 }: {
-  iteration: types.AutoTuneIteration;
+  progress: types.CameraGroupProgress[];
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const hasAdjustments = iteration.adjustments.length > 0;
+  if (progress.length === 0) return null;
 
   return (
-    <>
-      <TableRow
-        hover
-        sx={{ cursor: hasAdjustments ? "pointer" : "default" }}
-        onClick={() => hasAdjustments && setExpanded((prev) => !prev)}
-      >
-        <TableCell>{iteration.iteration}</TableCell>
-        <TableCell>
-          {iteration.passed}/{iteration.total} passed
-        </TableCell>
-        <TableCell>
-          <Chip
-            size="small"
-            label={iteration.status}
-            color={
-              iteration.status === "complete"
-                ? "success"
-                : iteration.status === "improved"
-                  ? "info"
-                  : iteration.status === "error"
-                    ? "error"
-                    : "default"
-            }
-          />
-        </TableCell>
-        <TableCell>{iteration.adjustments.length} change(s)</TableCell>
-        <TableCell>
-          <Typography variant="body2" noWrap sx={{ maxWidth: 300 }}>
-            {iteration.message}
-          </Typography>
-        </TableCell>
-      </TableRow>
-      {hasAdjustments && (
-        <TableRow>
-          <TableCell
-            colSpan={5}
-            sx={{ p: 0, borderBottom: expanded ? undefined : 0 }}
-          >
-            <Collapse in={expanded} timeout="auto" unmountOnExit>
-              <Box sx={{ p: 2, bgcolor: "background.default" }}>
-                <Typography variant="subtitle2" gutterBottom>
-                  Parameter changes
-                </Typography>
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Camera</TableCell>
-                      <TableCell>Domain</TableCell>
-                      <TableCell>Parameter</TableCell>
-                      <TableCell align="right">Old</TableCell>
-                      <TableCell align="right">New</TableCell>
-                      <TableCell>Reason</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {iteration.adjustments.map((adj) => (
-                      <TableRow
-                        key={`${adj.source_camera}-${adj.param_path.join(".")}`}
-                      >
-                        <TableCell>{adj.source_camera}</TableCell>
-                        <TableCell>
-                          <Chip
-                            size="small"
-                            variant="outlined"
-                            label={`${adj.component}.${adj.domain}`}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <code>{adj.param_path.join(".")}</code>
-                        </TableCell>
-                        <TableCell align="right">
-                          <code>{adj.old_value}</code>
-                        </TableCell>
-                        <TableCell align="right">
-                          <code>{adj.new_value}</code>
-                        </TableCell>
-                        <TableCell>
-                          <Typography variant="body2" sx={{ maxWidth: 280 }}>
-                            {adj.reason}
-                          </Typography>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </Box>
-            </Collapse>
-          </TableCell>
-        </TableRow>
-      )}
-    </>
-  );
-}
-
-function AutoTuneProgress({ state }: { state: types.AutoTuneState }) {
-  const progress =
-    state.max_iterations > 0
-      ? (state.current_iteration / state.max_iterations) * 100
-      : 0;
-
-  const chipColor = (() => {
-    switch (state.status) {
-      case "complete":
-        return "success" as const;
-      case "running":
-        return "warning" as const;
-      case "restarting":
-        return "info" as const;
-      case "error":
-        return "error" as const;
-      case "cancelled":
-        return "default" as const;
-      default:
-        return "default" as const;
-    }
-  })();
-
-  return (
-    <Stack spacing={1.5}>
-      <Stack direction="row" spacing={1} alignItems="center">
-        <Chip size="small" label={state.status} color={chipColor} />
-        <Typography variant="body2" color="text.secondary">
-          Iteration {state.current_iteration} / {state.max_iterations}
-        </Typography>
-        {state.status === "running" && (
-          <CircularProgress size={16} />
-        )}
-      </Stack>
-
-      <LinearProgress
-        variant="determinate"
-        value={progress}
-        sx={{ borderRadius: 1 }}
-      />
-
-      {state.message && (
-        <Alert
-          severity={
-            state.status === "complete"
-              ? "success"
-              : state.status === "error"
-                ? "error"
-                : state.status === "restarting"
-                  ? "info"
-                  : "info"
-          }
+    <Stack spacing={0.5} sx={{ mt: 2 }}>
+      <Typography variant="subtitle2">Camera progress</Typography>
+      {progress.map((group) => (
+        <Stack
+          key={group.source_camera}
+          direction="row"
+          spacing={1}
+          alignItems="center"
         >
-          {state.message}
-        </Alert>
-      )}
-
-      {state.iterations.length > 0 && (
-        <TableContainer component={Paper} variant="outlined">
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell>#</TableCell>
-                <TableCell>Result</TableCell>
-                <TableCell>Status</TableCell>
-                <TableCell>Adjustments</TableCell>
-                <TableCell>Message</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {state.iterations.map((it) => (
-                <AutoTuneIterationRow key={it.iteration} iteration={it} />
-              ))}
-            </TableBody>
-          </Table>
-        </TableContainer>
-      )}
+          {group.status === "done" && <CheckCircleIcon color="success" fontSize="small" />}
+          {group.status === "running" && <CircularProgress size={16} />}
+          {group.status === "pending" && (
+            <RadioButtonUncheckedIcon color="disabled" fontSize="small" />
+          )}
+          <Typography variant="body2">{group.source_camera}</Typography>
+          {group.status !== "pending" && (
+            <Typography variant="body2" color="text.secondary">
+              {group.passed}/{group.total} passed
+            </Typography>
+          )}
+        </Stack>
+      ))}
     </Stack>
   );
 }
 
-function AutoTuneSection() {
-  const autoTuneQuery = useAutoTuneState();
-  const startAutoTune = useStartAutoTune();
-  const cancelAutoTune = useCancelAutoTune();
-  const [maxIter, setMaxIter] = useState(10);
+// ---------------------------------------------------------------------------
+// Recommendations panel
+// ---------------------------------------------------------------------------
 
-  const state = autoTuneQuery.data?.auto_tune;
-  const isRunning = state?.status === "running";
-  const isRestarting = state?.status === "restarting";
-
-  const startError = useMemo(() => {
-    if (!startAutoTune.error) return null;
-    const response = startAutoTune.error.response;
-    if (response?.data?.error) return response.data.error;
-    return startAutoTune.error.message;
-  }, [startAutoTune.error]);
+function RecommendationsPanel({
+  recommendations,
+}: {
+  recommendations: types.Recommendation[];
+}) {
+  if (recommendations.length === 0) return null;
 
   return (
     <Card sx={{ mb: 3 }}>
       <CardContent>
-        <Stack spacing={2}>
-          <Stack
-            direction={{ xs: "column", sm: "row" }}
-            spacing={2}
-            alignItems={{ sm: "center" }}
-            justifyContent="space-between"
-          >
-            <Box>
-              <Typography variant="h6">
-                <AutoFixHighIcon
-                  sx={{ verticalAlign: "middle", mr: 1 }}
-                  fontSize="small"
-                />
-                Auto-tune
-              </Typography>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Automatically adjusts detection parameters (thresholds,
-                confidence, size filters) based on test failures. Each iteration
-                runs all tests, analyzes what went wrong, tweaks the config, and
-                restarts Viseron.
-              </Typography>
-            </Box>
-            <Stack direction="row" spacing={1} alignItems="center">
-              {!isRunning && !isRestarting && (
-                <>
-                  <TextField
-                    label="Max iterations"
-                    type="number"
-                    size="small"
-                    value={maxIter}
-                    onChange={(e) =>
-                      setMaxIter(
-                        Math.max(1, Math.min(50, Number(e.target.value) || 1)),
-                      )
-                    }
-                    slotProps={{
-                      htmlInput: { min: 1, max: 50, style: { width: 60 } },
-                    }}
-                  />
-                  <Button
-                    variant="contained"
-                    color="secondary"
-                    startIcon={
-                      startAutoTune.isPending ? (
-                        <CircularProgress size={18} color="inherit" />
-                      ) : (
-                        <AutoFixHighIcon />
-                      )
-                    }
-                    onClick={() => startAutoTune.mutate(maxIter)}
-                    disabled={startAutoTune.isPending}
-                  >
-                    Start auto-tune
-                  </Button>
-                </>
-              )}
-              {isRunning && (
-                <Button
-                  variant="outlined"
-                  color="warning"
-                  startIcon={<StopIcon />}
-                  onClick={() => cancelAutoTune.mutate()}
-                  disabled={cancelAutoTune.isPending}
+        <Typography variant="h6" gutterBottom>
+          Recommended parameter adjustments
+        </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          Based on test failures, these config changes may improve detection
+          accuracy. Enable <em>Auto-correct</em> to apply them automatically.
+        </Typography>
+        <TableContainer component={Paper} variant="outlined">
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell>Camera</TableCell>
+                <TableCell>Domain</TableCell>
+                <TableCell>Parameter</TableCell>
+                <TableCell align="right">Current</TableCell>
+                <TableCell align="right">Suggested</TableCell>
+                <TableCell>Reason</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {recommendations.map((rec) => (
+                <TableRow
+                  key={`${rec.source_camera}-${rec.param_path.join(".")}`}
                 >
-                  Cancel
-                </Button>
-              )}
-            </Stack>
-          </Stack>
-
-          {startError && (
-            <Alert severity="error" sx={{ maxWidth: 500 }}>
-              {startError}
-            </Alert>
-          )}
-
-          {state && (
-            <AutoTuneProgress state={state} />
-          )}
-        </Stack>
+                  <TableCell>{rec.source_camera}</TableCell>
+                  <TableCell>
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${rec.component}.${rec.domain}`}
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <code>{rec.param_path.join(".")}</code>
+                  </TableCell>
+                  <TableCell align="right">
+                    <code>{rec.old_value}</code>
+                  </TableCell>
+                  <TableCell align="right">
+                    <code>{rec.new_value}</code>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="body2" sx={{ maxWidth: 280 }}>
+                      {rec.reason}
+                    </Typography>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
       </CardContent>
     </Card>
   );
@@ -504,10 +314,12 @@ function SummaryCard({
   triggerError,
 }: {
   run: types.TestRunDetail | null | undefined;
-  onRunTests: () => void;
+  onRunTests: (autoCorrect: boolean, maxRepetitions: number) => void;
   isTriggering: boolean;
   triggerError: string | null;
 }) {
+  const [autoCorrect, setAutoCorrect] = useState(false);
+  const [maxRepetitions, setMaxRepetitions] = useState(3);
   const hasRun = run !== null && run !== undefined;
   const color = hasRun
     ? statusColor(run.passed, run.failed, run.status)
@@ -564,6 +376,9 @@ function SummaryCard({
                 configured cases.
               </Typography>
             )}
+            {hasRun && run.progress && run.progress.length > 0 && (
+              <SequentialProgress progress={run.progress} />
+            )}
           </Box>
           <Stack spacing={1} alignItems="flex-end">
             <Button
@@ -576,11 +391,39 @@ function SummaryCard({
                   <PlayArrowIcon />
                 )
               }
-              onClick={onRunTests}
+              onClick={() => onRunTests(autoCorrect, maxRepetitions)}
               disabled={isTriggering}
             >
               Run tests
             </Button>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={autoCorrect}
+                  onChange={(e) => setAutoCorrect(e.target.checked)}
+                />
+              }
+              label={
+                <Typography variant="body2">Auto-correct</Typography>
+              }
+            />
+            {autoCorrect && (
+              <TextField
+                label="Max repetitions"
+                type="number"
+                size="small"
+                value={maxRepetitions}
+                onChange={(e) =>
+                  setMaxRepetitions(
+                    Math.max(1, Math.min(10, Number(e.target.value) || 1)),
+                  )
+                }
+                slotProps={{
+                  htmlInput: { min: 1, max: 10, style: { width: 60 } },
+                }}
+              />
+            )}
             {triggerError && (
               <Alert severity="error" sx={{ maxWidth: 320 }}>
                 {triggerError}
@@ -683,59 +526,6 @@ function TestResultRow({ result }: { result: types.TestCaseResult }) {
   );
 }
 
-function RestartBanner({ pendingCount }: { pendingCount: number }) {
-  const restart = useRestartViseron();
-
-  if (pendingCount === 0) return null;
-
-  const handleRestart = () => {
-    if (
-      !window.confirm(
-        `Restart Viseron to pick up ${pendingCount} pending test case(s)? ` +
-          "The UI will be unavailable for a few seconds while Viseron comes back up.",
-      )
-    ) {
-      return;
-    }
-    restart.mutate(undefined, {
-      onSuccess: () => {
-        // Give the supervisor a moment, then bounce the page so React Query
-        // reconnects to the fresh process cleanly.
-        setTimeout(() => window.location.reload(), 3000);
-      },
-    });
-  };
-
-  return (
-    <Alert
-      severity="warning"
-      sx={{ mb: 3 }}
-      action={
-        <Button
-          color="inherit"
-          size="small"
-          startIcon={
-            restart.isPending ? (
-              <CircularProgress size={16} color="inherit" />
-            ) : (
-              <RestartAltIcon />
-            )
-          }
-          onClick={handleRestart}
-          disabled={restart.isPending}
-        >
-          Restart Viseron
-        </Button>
-      }
-    >
-      {pendingCount} test case
-      {pendingCount === 1 ? " is" : "s are"} waiting for a restart to become
-      runnable. Viseron needs to reload its config before new cases can
-      execute.
-    </Alert>
-  );
-}
-
 function TestCasesSection() {
   const casesQuery = useTestCases();
   const deleteCase = useDeleteTestCase();
@@ -810,13 +600,6 @@ function TestCasesSection() {
                     }
                     label={testCase.polarity}
                   />
-                  {testCase.pending_restart && (
-                    <Chip
-                      size="small"
-                      color="warning"
-                      label="pending restart"
-                    />
-                  )}
                 </Stack>
                 <Typography variant="body2" color="text.secondary">
                   Camera: {testCase.camera_identifier} · Duration:{" "}
@@ -971,9 +754,7 @@ function Tests() {
 
   const runs = runsQuery.data?.runs || [];
   const casesList = useTestCases();
-  const pendingRestartCount = (casesList.data?.cases || []).filter(
-    (testCase) => testCase.pending_restart,
-  ).length;
+  const componentEnabled = casesList.data?.component_enabled ?? true;
 
   return (
     <Container maxWidth="lg" sx={{ py: 3 }}>
@@ -984,64 +765,88 @@ function Tests() {
         Tests live in a separate tab so they never mix with your live events.
         Run cases declared under the <code>test_runner</code> section of your
         config or created via <em>Use for test</em> to verify motion and
-        object detection against pre-recorded footage.
+        object detection against pre-recorded footage. Tests run sequentially,
+        one camera at a time.
       </Typography>
 
-      <GuidancePanel />
-
-      <RestartBanner pendingCount={pendingRestartCount} />
-
-      <SummaryCard
-        run={effectiveRun}
-        onRunTests={() => trigger.mutate()}
-        isTriggering={trigger.isPending}
-        triggerError={triggerError}
-      />
-
-      <AutoTuneSection />
-
-      {effectiveRun && (
-        <Box sx={{ mb: 3 }}>
-          <Typography variant="h6" gutterBottom>
-            Run #{effectiveRun.id} results
-          </Typography>
-          <RunDetailTable run={effectiveRun} />
-        </Box>
+      {!componentEnabled && (
+        <Alert severity="warning" sx={{ mb: 3 }}>
+          The <code>test_runner</code> component is not enabled. Add{" "}
+          <code>test_runner: {"{}"}</code> to your <code>config.yaml</code> and
+          restart Viseron to enable test execution.
+        </Alert>
       )}
 
-      <Divider sx={{ my: 3 }} />
+      {componentEnabled && (
+        <>
+          <GuidancePanel />
 
-      <Typography variant="h6" gutterBottom>
-        Test case catalog
-      </Typography>
-      <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        Cases saved via <em>Use for test</em> live here. Watch the clip,
-        copy the matching YAML snippet into your <code>config.yaml</code>,
-        and delete cases you no longer need.
-      </Typography>
-      <TestCasesSection />
+          <SummaryCard
+            run={effectiveRun}
+            onRunTests={(autoCorrect, maxRepetitions) =>
+              trigger.mutate({
+                auto_correct: autoCorrect,
+                max_repetitions: maxRepetitions,
+              })
+            }
+            isTriggering={trigger.isPending}
+            triggerError={triggerError}
+          />
 
-      <Divider sx={{ my: 3 }} />
+          {effectiveRun &&
+            effectiveRun.recommendations &&
+            effectiveRun.recommendations.length > 0 && (
+              <RecommendationsPanel
+                recommendations={effectiveRun.recommendations}
+              />
+            )}
 
-      <Typography variant="h6" gutterBottom>
-        Run history
-      </Typography>
-      <RunHistoryTable
-        runs={runs}
-        selectedId={selectedRunId}
-        onSelect={setSelectedRunId}
-      />
+          {effectiveRun && (
+            <Box sx={{ mb: 3 }}>
+              <Typography variant="h6" gutterBottom>
+                Run #{effectiveRun.id} results
+              </Typography>
+              <RunDetailTable run={effectiveRun} />
+            </Box>
+          )}
 
-      {selectedRunId !== null && (
-        <Box sx={{ mt: 1 }}>
-          <IconButton
-            size="small"
-            onClick={() => setSelectedRunId(null)}
-            aria-label="Back to latest run"
-          >
-            <Typography variant="caption">&larr; back to latest</Typography>
-          </IconButton>
-        </Box>
+          <Divider sx={{ my: 3 }} />
+
+          <Typography variant="h6" gutterBottom>
+            Test case catalog
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Cases saved via <em>Use for test</em> live here. Watch the clip,
+            copy the matching YAML snippet into your{" "}
+            <code>config.yaml</code>, and delete cases you no longer need.
+          </Typography>
+          <TestCasesSection />
+
+          <Divider sx={{ my: 3 }} />
+
+          <Typography variant="h6" gutterBottom>
+            Run history
+          </Typography>
+          <RunHistoryTable
+            runs={runs}
+            selectedId={selectedRunId}
+            onSelect={setSelectedRunId}
+          />
+
+          {selectedRunId !== null && (
+            <Box sx={{ mt: 1 }}>
+              <IconButton
+                size="small"
+                onClick={() => setSelectedRunId(null)}
+                aria-label="Back to latest run"
+              >
+                <Typography variant="caption">
+                  &larr; back to latest
+                </Typography>
+              </IconButton>
+            </Box>
+          )}
+        </>
       )}
     </Container>
   );

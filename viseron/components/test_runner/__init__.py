@@ -20,15 +20,12 @@ import voluptuous as vol
 
 from .const import (
     COMPONENT,
-    CONFIG_AUTO_START,
     CONFIG_CAMERA_READY_TIMEOUT,
     CONFIG_DEFAULT_DURATION,
     CONFIG_SHUTDOWN_ON_COMPLETE,
-    DEFAULT_AUTO_START,
     DEFAULT_CAMERA_READY_TIMEOUT,
     DEFAULT_DURATION,
     DEFAULT_SHUTDOWN_ON_COMPLETE,
-    DESC_AUTO_START,
     DESC_CAMERA_READY_TIMEOUT,
     DESC_COMPONENT,
     DESC_DEFAULT_DURATION,
@@ -71,11 +68,6 @@ CONFIG_SCHEMA = vol.Schema(
                     description=DESC_CAMERA_READY_TIMEOUT,
                 ): vol.All(int, vol.Range(min=1, max=3600)),
                 vol.Optional(
-                    CONFIG_AUTO_START,
-                    default=DEFAULT_AUTO_START,
-                    description=DESC_AUTO_START,
-                ): bool,
-                vol.Optional(
                     CONFIG_DEFAULT_DURATION,
                     default=DEFAULT_DURATION,
                     description=DESC_DEFAULT_DURATION,
@@ -105,7 +97,6 @@ def _merge_settings(
     for key in (
         CONFIG_SHUTDOWN_ON_COMPLETE,
         CONFIG_CAMERA_READY_TIMEOUT,
-        CONFIG_AUTO_START,
         CONFIG_DEFAULT_DURATION,
     ):
         if key in settings:
@@ -163,12 +154,6 @@ def setup(vis: "Viseron", config: dict[str, Any]) -> bool:
         len(yaml_cases),
         len(db_cases),
     )
-
-    if block[CONFIG_AUTO_START]:
-        try:
-            component.trigger_run()
-        except RuntimeError as err:
-            LOGGER.warning("test_runner: auto_start skipped — %s", err)
     return True
 
 

@@ -247,6 +247,14 @@ class TestsAPIHandler(BaseAPIHandler):
             "path_pattern": r"/tests/runs",
             "supported_methods": ["POST"],
             "method": "post_run",
+            "json_body_schema": vol.Schema(
+                {
+                    vol.Optional("auto_correct", default=False): bool,
+                    vol.Optional("max_repetitions", default=5): vol.All(
+                        int, vol.Range(min=1, max=20)
+                    ),
+                }
+            ),
         },
         {
             "requires_role": [Role.ADMIN, Role.WRITE],
@@ -367,10 +375,48 @@ class TestsAPIHandler(BaseAPIHandler):
                 .all()
             )
             subpath = self.get_subpath()
-            return {
+            data: dict[str, Any] = {
                 **_serialize_run(run),
-                "results": [_serialize_result(result, subpath) for result in results],
+                "results": [
+                    _serialize_result(result, subpath) for result in results
+                ],
+                "progress": [],
+                "recommendations": [],
             }
+
+        # If there's a live runner for this run, attach progress and
+        # recommendations from the in-memory state.
+        component: "TestRunnerComponent | None" = self._vis.data.get(
+            TEST_RUNNER_COMPONENT
+        )
+        if component and component.current_runner:
+            runner = component.current_runner
+            if runner.summary and runner.summary.run_id == run_id:
+                data["recommendations"] = runner.recommendations
+            if not runner.completion_event.is_set():
+                data["progress"] = [
+                    {
+                        "source_camera": p.source_camera,
+                        "status": p.status,
+                        "total": p.total,
+                        "passed": p.passed,
+                        "failed": p.failed,
+                    }
+                    for p in runner.progress
+                ]
+            elif runner.summary and runner.summary.run_id == run_id:
+                data["progress"] = [
+                    {
+                        "source_camera": p.source_camera,
+                        "status": p.status,
+                        "total": p.total,
+                        "passed": p.passed,
+                        "failed": p.failed,
+                    }
+                    for p in runner.progress
+                ]
+
+        return data
 
     def _query_latest_run(
         self,
@@ -437,13 +483,17 @@ class TestsAPIHandler(BaseAPIHandler):
                 "test_runner component is not configured",
             )
             return
+        body = self.request_body or {}
+        auto_correct = bool(body.get("auto_correct", False))
+        max_repetitions = int(body.get("max_repetitions", 5))
         try:
-            runner = component.trigger_run()
+            runner = component.trigger_run(
+                auto_correct=auto_correct,
+                max_repetitions=max_repetitions,
+            )
         except RuntimeError as err:
             self.response_error(HTTPStatus.CONFLICT, str(err))
             return
-        # The run may still be racing to insert its TestRun row — callers
-        # should poll GET /tests/runs/latest to pick it up once visible.
         await self.response_success(
             status=HTTPStatus.ACCEPTED,
             response={
@@ -577,31 +627,18 @@ class TestsAPIHandler(BaseAPIHandler):
                 serialized.append(entry)
             return serialized
 
-    def _is_case_registered(self, case: dict[str, Any]) -> bool:
-        """Return True if the synthesized test camera for ``case`` is live.
-
-        Used to decorate catalog entries with a ``pending_restart`` flag
-        so the frontend can show a "Restart Viseron" prompt for cases
-        added after the current process started.
-        """
-        synth_id = _synth_test_camera_id(
-            case["camera_identifier"], case["slug"]
-        )
-        try:
-            self._vis.get_registered_domain(CAMERA_DOMAIN, synth_id)
-        except DomainNotRegisteredError:
-            return False
-        return True
-
     async def get_cases(self) -> None:
         """List all catalogued test cases."""
         camera_identifier = self.request_arguments.get("camera_identifier")
         cases = await self.run_in_executor(
             self._query_cases, self._get_session, camera_identifier
         )
-        for case in cases:
-            case["pending_restart"] = not self._is_case_registered(case)
-        await self.response_success(response={"cases": cases})
+        component_enabled = self._vis.data.get(
+            TEST_RUNNER_COMPONENT
+        ) is not None
+        await self.response_success(
+            response={"cases": cases, "component_enabled": component_enabled}
+        )
 
     def _delete_case(
         self,

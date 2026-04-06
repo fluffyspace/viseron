@@ -48,9 +48,17 @@ async function fetchLatestRun(): Promise<types.TestRunDetailResponse> {
   return response.data;
 }
 
-async function postRun(): Promise<types.TestRunStartResponse> {
+export type TriggerRunParams = {
+  auto_correct?: boolean;
+  max_repetitions?: number;
+};
+
+async function postRun(
+  params?: TriggerRunParams,
+): Promise<types.TestRunStartResponse> {
   const response = await viseronAPI.post<types.TestRunStartResponse>(
     "tests/runs",
+    params ?? {},
   );
   return response.data;
 }
@@ -145,11 +153,12 @@ export function useLatestTestRun(): UseQueryResult<
 export function useTriggerTestRun(): UseMutationResult<
   types.TestRunStartResponse,
   types.APIErrorResponse,
-  void
+  TriggerRunParams | void
 > {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: postRun,
+    mutationFn: (params?: TriggerRunParams | void) =>
+      postRun(params ?? undefined),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: RUNS_KEY });
       await queryClient.invalidateQueries({ queryKey: LATEST_KEY });

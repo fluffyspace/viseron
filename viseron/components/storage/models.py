@@ -351,6 +351,9 @@ class TestRun(Base):
     status: Mapped[str] = mapped_column(
         String, nullable=False, server_default="running"
     )
+    auto_correct_state: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
     )

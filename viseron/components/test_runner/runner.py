@@ -1,11 +1,12 @@
 """Orchestrate a single test run."""
 from __future__ import annotations
 
+import collections
 import copy
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import delete, insert, select, update
@@ -85,6 +86,17 @@ class RunSummary:
     def all_passed(self) -> bool:
         """Return True if the run completed with zero failures."""
         return self.status == STATUS_COMPLETE and self.failed == 0 and self.total > 0
+
+
+@dataclass
+class CameraGroupProgress:
+    """Progress for a single source-camera group during sequential execution."""
+
+    source_camera: str
+    status: str = "pending"  # "pending" | "running" | "done"
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
 
 
 # --- synthetic camera synthesis --------------------------------------------
@@ -650,12 +662,12 @@ class TestRunnerComponent:
         return runner is not None and not runner.completion_event.is_set()
 
     def _collect_runnable_cases(self) -> list[RunnerCase]:
-        """Union tests.yaml cases with DB cases that have live cameras.
+        """Union tests.yaml cases with DB cases.
 
-        YAML cases are always runnable — their synthetic cameras were
-        registered at setup time. DB cases are normally registered at
-        runtime by refresh_db_cases; any that still lack a camera are
-        skipped as a safety net.
+        All cases whose synthetic cameras were injected (at setup or at
+        runtime via refresh_db_cases) are considered runnable. The
+        cameras are dormant (not started) until the runner explicitly
+        starts them for each sequential group.
         """
         runnable: list[RunnerCase] = list(self._yaml_cases)
         for case in self._db_cases:
@@ -672,7 +684,12 @@ class TestRunnerComponent:
             runnable.append(case)
         return runnable
 
-    def trigger_run(self) -> "TestRunner":
+    def trigger_run(
+        self,
+        *,
+        auto_correct: bool = False,
+        max_repetitions: int = 5,
+    ) -> "TestRunner":
         """Start a new run, refusing if one is already in flight."""
         with self._lock:
             if self.is_running:
@@ -686,7 +703,12 @@ class TestRunnerComponent:
                 )
             merged_config = dict(self._config)
             merged_config["cases"] = cases
-            runner = TestRunner(self._vis, merged_config)
+            runner = TestRunner(
+                self._vis,
+                merged_config,
+                auto_correct=auto_correct,
+                max_repetitions=max_repetitions,
+            )
             self._current_runner = runner
             runner.start()
             return runner
@@ -696,9 +718,23 @@ class TestRunnerComponent:
 
 
 class TestRunner:
-    """Execute a set of test cases against running cameras."""
+    """Execute test cases sequentially, one source-camera group at a time.
 
-    def __init__(self, vis: "Viseron", config: dict[str, Any]) -> None:
+    For each source camera the runner:
+    1. Starts the dormant test cameras.
+    2. Waits for the observation window.
+    3. Evaluates the cases.
+    4. Stops the cameras (freeing ffmpeg processes and memory).
+    """
+
+    def __init__(
+        self,
+        vis: "Viseron",
+        config: dict[str, Any],
+        *,
+        auto_correct: bool = False,
+        max_repetitions: int = 5,
+    ) -> None:
         self._vis = vis
         self._config = config
         self._cases: list[RunnerCase] = config["cases"]
@@ -706,6 +742,10 @@ class TestRunner:
         self._thread: threading.Thread | None = None
         self._completion = threading.Event()
         self._summary: RunSummary | None = None
+        self._auto_correct = auto_correct
+        self._max_repetitions = max_repetitions
+        self._progress: list[CameraGroupProgress] = []
+        self._recommendations: list[dict[str, Any]] = []
 
     @property
     def completion_event(self) -> threading.Event:
@@ -717,6 +757,16 @@ class TestRunner:
         """The final run summary, or None if the run has not finished."""
         return self._summary
 
+    @property
+    def progress(self) -> list[CameraGroupProgress]:
+        """Per-camera-group progress for sequential execution."""
+        return list(self._progress)
+
+    @property
+    def recommendations(self) -> list[dict[str, Any]]:
+        """Recommended parameter adjustments from the last run."""
+        return list(self._recommendations)
+
     def start(self) -> None:
         """Kick off the run in a background thread."""
         self._thread = threading.Thread(
@@ -726,43 +776,174 @@ class TestRunner:
         )
         self._thread.start()
 
+    # -- grouping helpers --------------------------------------------------
+
+    def _group_cases_by_source(self) -> dict[str, list[RunnerCase]]:
+        """Group cases by CONFIG_SOURCE_CAMERA, preserving insertion order."""
+        groups: dict[str, list[RunnerCase]] = collections.OrderedDict()
+        for case in self._cases:
+            src = case[CONFIG_SOURCE_CAMERA]
+            groups.setdefault(src, []).append(case)
+        return groups
+
+    # -- camera lifecycle --------------------------------------------------
+
+    def _resolve_camera(self, cam_id: str) -> AbstractCamera:
+        """Look up a registered test camera."""
+        timeout = float(self._config[CONFIG_CAMERA_READY_TIMEOUT])
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                camera = self._vis.get_registered_domain(CAMERA_DOMAIN, cam_id)
+            except DomainNotRegisteredError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"test_runner: camera {cam_id!r} not registered "
+                        f"within {timeout:.0f}s"
+                    )
+                time.sleep(0.5)
+                continue
+            if not camera.is_test_camera:
+                raise RuntimeError(
+                    f"camera {cam_id!r} is not a test camera — refusing to "
+                    f"run to avoid polluting live events."
+                )
+            return camera
+
+    def _start_cameras(
+        self, cases: list[RunnerCase]
+    ) -> dict[str, AbstractCamera]:
+        """Start dormant test cameras for a group of cases."""
+        cam_ids = {c[CONFIG_CAMERA] for c in cases}
+        cameras: dict[str, AbstractCamera] = {}
+        for cam_id in cam_ids:
+            camera = self._resolve_camera(cam_id)
+            LOGGER.info("test_runner: starting camera %s", cam_id)
+            camera.start_camera()
+            cameras[cam_id] = camera
+        # Give cameras a moment to connect and start producing frames.
+        self._wait_for_cameras_connected(cameras)
+        return cameras
+
+    def _wait_for_cameras_connected(
+        self, cameras: dict[str, AbstractCamera]
+    ) -> None:
+        """Poll until cameras report connected or timeout."""
+        timeout = float(self._config[CONFIG_CAMERA_READY_TIMEOUT])
+        deadline = time.monotonic() + timeout
+        pending = set(cameras.keys())
+        while pending and time.monotonic() < deadline:
+            for cam_id in list(pending):
+                if cameras[cam_id].connected:
+                    pending.discard(cam_id)
+            if pending:
+                time.sleep(0.5)
+        if pending:
+            LOGGER.warning(
+                "test_runner: cameras not connected within timeout: %s",
+                sorted(pending),
+            )
+
+    def _stop_cameras(self, cameras: dict[str, AbstractCamera]) -> None:
+        """Stop test cameras to free processes and memory."""
+        for cam_id, camera in cameras.items():
+            LOGGER.info("test_runner: stopping camera %s", cam_id)
+            try:
+                camera.stop_camera()
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception(
+                    "test_runner: error stopping camera %s", cam_id
+                )
+
+    # -- sequential run ----------------------------------------------------
+
     def _run(self) -> None:
         run_id: int | None = None
         try:
-            # Clear stale test-mode detections for the cameras we are about to
-            # exercise. Without this a detection from a previous run of the
-            # same case would be counted as belonging to this one. Runs doing
-            # this before resolving cameras so it happens even if the camera
-            # component starts emitting frames before we get a chance to
-            # observe them.
-            self._clear_stale_detections()
             run_id = self._insert_run_row()
+            groups = self._group_cases_by_source()
+
+            # Initialize progress tracking.
+            self._progress = [
+                CameraGroupProgress(
+                    source_camera=src,
+                    total=len(cases),
+                )
+                for src, cases in groups.items()
+            ]
+
             LOGGER.info(
-                "test_runner: starting run %d with %d case(s)",
+                "test_runner: starting run %d with %d case(s) across "
+                "%d camera group(s)",
                 run_id,
                 len(self._cases),
+                len(groups),
             )
-            cameras = self._resolve_cameras()
-            self._wait_for_observation_window()
-            outcomes = self._evaluate_all(cameras)
-            self._persist_results(run_id, outcomes)
-            passed = sum(1 for (_case, outcome) in outcomes if outcome.passed)
-            failed = len(outcomes) - passed
-            self._finalize_run(run_id, passed, failed, STATUS_COMPLETE)
+
+            all_outcomes: list[tuple[RunnerCase, CaseOutcome]] = []
+
+            for group_idx, (source_camera, cases) in enumerate(
+                groups.items()
+            ):
+                prog = self._progress[group_idx]
+                prog.status = "running"
+
+                cam_ids = {c[CONFIG_CAMERA] for c in cases}
+                self._clear_stale_detections(cam_ids)
+
+                cameras = self._start_cameras(cases)
+                try:
+                    max_dur = max(c[CONFIG_DURATION] for c in cases)
+                    LOGGER.info(
+                        "test_runner: observing %s for %ds (%d case(s))",
+                        source_camera,
+                        max_dur,
+                        len(cases),
+                    )
+                    time.sleep(max_dur)
+
+                    outcomes = self._evaluate_cases(cases, cameras)
+                    all_outcomes.extend(outcomes)
+
+                    passed = sum(
+                        1 for (_, o) in outcomes if o.passed
+                    )
+                    prog.passed = passed
+                    prog.failed = len(outcomes) - passed
+                finally:
+                    self._stop_cameras(cameras)
+
+                prog.status = "done"
+                LOGGER.info(
+                    "test_runner: %s done — %d passed, %d failed",
+                    source_camera,
+                    prog.passed,
+                    prog.failed,
+                )
+
+            # Persist results.
+            self._persist_results(run_id, all_outcomes)
+            total_passed = sum(
+                1 for (_, o) in all_outcomes if o.passed
+            )
+            total_failed = len(all_outcomes) - total_passed
+
+            # Generate recommendations from failures.
+            self._recommendations = self._generate_recommendations(
+                all_outcomes
+            )
+
+            self._finalize_run(run_id, total_passed, total_failed, STATUS_COMPLETE)
             self._summary = RunSummary(
                 run_id=run_id,
-                total=len(outcomes),
-                passed=passed,
-                failed=failed,
+                total=len(all_outcomes),
+                passed=total_passed,
+                failed=total_failed,
                 status=STATUS_COMPLETE,
             )
-            LOGGER.info(
-                "test_runner: run %d complete — %d passed, %d failed",
-                run_id,
-                passed,
-                failed,
-            )
-            for case, outcome in outcomes:
+
+            # Log results.
+            for case, outcome in all_outcomes:
                 marker = "PASS" if outcome.passed else "FAIL"
                 LOGGER.info(
                     "test_runner: [%s] %s (%s) — %s",
@@ -771,14 +952,39 @@ class TestRunner:
                     case[CONFIG_CAMERA],
                     outcome.message,
                 )
-            self._vis.exit_code = 0 if failed == 0 else 1
+            LOGGER.info(
+                "test_runner: run %d complete — %d passed, %d failed",
+                run_id,
+                total_passed,
+                total_failed,
+            )
+            if self._recommendations:
+                LOGGER.info(
+                    "test_runner: %d recommendation(s) generated",
+                    len(self._recommendations),
+                )
+
+            self._vis.exit_code = 0 if total_failed == 0 else 1
+
+            # Auto-correct: apply recommendations and restart.
+            if (
+                self._auto_correct
+                and total_failed > 0
+                and self._recommendations
+            ):
+                self._apply_auto_correct(run_id)
+
         except Exception as err:  # pylint: disable=broad-except
             LOGGER.exception("test_runner: run failed")
             if run_id is not None:
                 try:
-                    self._finalize_run(run_id, 0, 0, STATUS_ERROR, error=str(err))
+                    self._finalize_run(
+                        run_id, 0, 0, STATUS_ERROR, error=str(err)
+                    )
                 except Exception:  # pylint: disable=broad-except
-                    LOGGER.exception("test_runner: failed to finalize errored run")
+                    LOGGER.exception(
+                        "test_runner: failed to finalize errored run"
+                    )
             self._summary = RunSummary(
                 run_id=run_id,
                 total=len(self._cases),
@@ -794,11 +1000,13 @@ class TestRunner:
                 LOGGER.info("test_runner: shutting down viseron")
                 self._vis.shutdown()
 
-    def _clear_stale_detections(self) -> None:
-        """Remove existing test-mode rows for all referenced cameras."""
-        identifiers = sorted({case[CONFIG_CAMERA] for case in self._cases})
-        if not identifiers:
+    # -- helpers -----------------------------------------------------------
+
+    def _clear_stale_detections(self, cam_ids: set[str]) -> None:
+        """Remove existing test-mode rows for the given cameras."""
+        if not cam_ids:
             return
+        identifiers = sorted(cam_ids)
         with self._storage.get_session() as session:
             session.execute(
                 delete(Motion)
@@ -828,55 +1036,13 @@ class TestRunner:
             session.commit()
             return run_id
 
-    def _resolve_cameras(self) -> dict[str, AbstractCamera]:
-        """Wait until every referenced camera is registered and in test mode."""
-        timeout = float(self._config[CONFIG_CAMERA_READY_TIMEOUT])
-        deadline = time.monotonic() + timeout
-        required = {case[CONFIG_CAMERA] for case in self._cases}
-        resolved: dict[str, AbstractCamera] = {}
-        while required:
-            for identifier in list(required):
-                try:
-                    camera = self._vis.get_registered_domain(CAMERA_DOMAIN, identifier)
-                except DomainNotRegisteredError:
-                    continue
-                if not camera.is_test_camera:
-                    raise RuntimeError(
-                        f"camera {identifier!r} is referenced by the test_runner "
-                        f"but is not configured with test_mode=true — refusing to "
-                        f"run to avoid polluting live events."
-                    )
-                resolved[identifier] = camera
-                required.discard(identifier)
-            if not required:
-                break
-            if time.monotonic() > deadline:
-                missing = sorted(required)
-                raise TimeoutError(
-                    f"test_runner: cameras not ready within {timeout:.0f}s: "
-                    f"{missing}"
-                )
-            time.sleep(0.5)
-        return resolved
-
-    def _wait_for_observation_window(self) -> None:
-        """Sleep long enough that every case's video has played through.
-
-        All cameras run in parallel, so the total wait is the max of per-case
-        durations, not the sum.
-        """
-        max_duration = max(case[CONFIG_DURATION] for case in self._cases)
-        LOGGER.info(
-            "test_runner: observing cameras for %d second(s)", max_duration
-        )
-        time.sleep(max_duration)
-
-    def _evaluate_all(
+    def _evaluate_cases(
         self,
+        cases: list[RunnerCase],
         cameras: dict[str, AbstractCamera],
     ) -> list[tuple[RunnerCase, CaseOutcome]]:
         results: list[tuple[RunnerCase, CaseOutcome]] = []
-        for case in self._cases:
+        for case in cases:
             camera = cameras[case[CONFIG_CAMERA]]
             outcome = evaluate_case(
                 kind=case[CONFIG_KIND],
@@ -933,8 +1099,101 @@ class TestRunner:
         if error:
             LOGGER.error("test_runner: run %d errored: %s", run_id, error)
 
+    # -- recommendations ---------------------------------------------------
+
+    def _generate_recommendations(
+        self, outcomes: list[tuple[RunnerCase, CaseOutcome]]
+    ) -> list[dict[str, Any]]:
+        """Generate parameter adjustment recommendations from failures."""
+        from .auto_tuner import Adjustment, propose_adjustments
+
+        results = [
+            {
+                "case_name": case[CONFIG_NAME],
+                "passed": outcome.passed,
+                "actual": outcome.actual,
+                "expected": case[CONFIG_EXPECTED],
+            }
+            for case, outcome in outcomes
+        ]
+
+        try:
+            from viseron.components.test_runner.auto_tuner import _load_config
+
+            config = _load_config()
+        except Exception:  # pylint: disable=broad-except
+            LOGGER.warning(
+                "test_runner: could not load config for recommendations"
+            )
+            return []
+
+        adjustments = propose_adjustments(self._cases, results, config)
+        return [
+            {
+                "source_camera": a.source_camera,
+                "domain": a.domain,
+                "component": a.component,
+                "param_path": a.param_path,
+                "old_value": a.old_value,
+                "new_value": a.new_value,
+                "reason": a.reason,
+            }
+            for a in adjustments
+        ]
+
+    # -- auto-correct ------------------------------------------------------
+
+    def _apply_auto_correct(self, run_id: int) -> None:
+        """Apply recommended adjustments to config.yaml and restart."""
+        import os
+        import signal
+
+        from viseron.const import RESTART_EXIT_CODE
+
+        from .auto_tuner import Adjustment, apply_adjustments
+
+        adjustments = [
+            Adjustment(
+                source_camera=r["source_camera"],
+                domain=r["domain"],
+                component=r["component"],
+                param_path=r["param_path"],
+                old_value=r["old_value"],
+                new_value=r["new_value"],
+                reason=r["reason"],
+            )
+            for r in self._recommendations
+        ]
+
+        LOGGER.info(
+            "test_runner: auto-correct applying %d adjustment(s) and "
+            "requesting restart",
+            len(adjustments),
+        )
+        apply_adjustments(adjustments)
+
+        # Store auto-correct state so the next boot can resume.
+        with self._storage.get_session() as session:
+            stmt = (
+                update(TestRun)
+                .where(TestRun.id == run_id)
+                .values(
+                    auto_correct_state={
+                        "enabled": True,
+                        "max_repetitions": self._max_repetitions,
+                        "current_repetition": 1,
+                    },
+                )
+            )
+            session.execute(stmt)
+            session.commit()
+
+        self._vis.exit_code = RESTART_EXIT_CODE
+        os.kill(os.getpid(), signal.SIGINT)
+
 
 __all__ = [
+    "CameraGroupProgress",
     "RunSummary",
     "TestRunner",
     "TestRunnerComponent",

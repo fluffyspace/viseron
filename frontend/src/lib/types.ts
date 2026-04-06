@@ -440,8 +440,28 @@ export type TestCaseResult = {
   created_timestamp: number | null;
 };
 
+export type CameraGroupProgress = {
+  source_camera: string;
+  status: "pending" | "running" | "done" | string;
+  total: number;
+  passed: number;
+  failed: number;
+};
+
+export type Recommendation = {
+  source_camera: string;
+  domain: string;
+  component: string;
+  param_path: string[];
+  old_value: number;
+  new_value: number;
+  reason: string;
+};
+
 export type TestRunDetail = TestRunSummary & {
   results: TestCaseResult[];
+  progress: CameraGroupProgress[];
+  recommendations: Recommendation[];
 };
 
 export type TestRunsListResponse = {
@@ -489,11 +509,11 @@ export type TestCase = {
   duration: number;
   created_at: string | null;
   snippet: string;
-  pending_restart: boolean;
 };
 
 export type TestCasesListResponse = {
   cases: TestCase[];
+  component_enabled: boolean;
 };
 
 export type AutoTuneAdjustment = {
