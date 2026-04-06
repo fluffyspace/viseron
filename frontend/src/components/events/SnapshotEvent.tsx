@@ -14,9 +14,8 @@ import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import { useTheme } from "@mui/material/styles";
 import useMediaQuery from "@mui/material/useMediaQuery";
-import PopupState, { bindHover, bindPopover } from "material-ui-popup-state";
-import HoverPopover from "material-ui-popup-state/HoverPopover";
-import { memo, useCallback, useMemo, useRef } from "react";
+import PopupState, { bindPopover, bindTrigger } from "material-ui-popup-state";
+import { memo, useMemo } from "react";
 
 import { CameraNameOverlay } from "components/camera/CameraNameOverlay";
 import {
@@ -36,7 +35,7 @@ import {
 import { ImageWithFallback } from "components/images/ImageWithFallback";
 import { useFirstRender } from "hooks/UseFirstRender";
 import { useExportEvent } from "lib/commands";
-import { BLANK_IMAGE, isTouchDevice, toTitleCase } from "lib/helpers";
+import { BLANK_IMAGE, toTitleCase } from "lib/helpers";
 import {
   getDayjsFromDateTimeString,
   getTimeStringFromDayjs,
@@ -226,50 +225,14 @@ function Divider() {
 
 export function SnapshotIcon({ events }: { events: types.CameraEvent[] }) {
   const Icon = getIcon(events[0]);
-  const PopoverComponent = isTouchDevice() ? Popover : HoverPopover;
-
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const handleOnMouseEnter = useCallback(
-    (
-      e: React.MouseEvent<HTMLElement>,
-      onMouseOver: (e: React.MouseEvent<HTMLElement>) => void,
-    ) => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
-
-      const currentTarget = e.currentTarget;
-      timeoutRef.current = setTimeout(() => {
-        e.currentTarget = currentTarget;
-        onMouseOver(e);
-      }, 100);
-    },
-    [timeoutRef],
-  );
-
-  const handleMouseLeave = useCallback(
-    (e: React.MouseEvent, onMouseLeave: (event: React.MouseEvent) => void) => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
-
-      onMouseLeave(e);
-    },
-    [timeoutRef],
-  );
 
   return (
     <PopupState variant="popover">
-      {(popupState) => {
-        const { onMouseLeave, onMouseOver, ...rest } = bindHover(popupState);
-
-        return (
+      {(popupState) => (
           <div>
             <Box
               // eslint-disable-next-line react/jsx-props-no-spreading
-              {...rest}
-              onMouseOver={(e) => handleOnMouseEnter(e, onMouseOver)}
-              onMouseLeave={(e) => handleMouseLeave(e, onMouseLeave)}
+              {...bindTrigger(popupState)}
               sx={(theme) => ({
                 display: "flex",
                 alignItems: "center",
@@ -301,7 +264,7 @@ export function SnapshotIcon({ events }: { events: types.CameraEvent[] }) {
                 }}
               />
             </Box>
-            <PopoverComponent
+            <Popover
               onClick={(e) => {
                 e.stopPropagation();
                 e.preventDefault();
@@ -329,10 +292,9 @@ export function SnapshotIcon({ events }: { events: types.CameraEvent[] }) {
               }}
             >
               <PopoverContent events={events} />
-            </PopoverComponent>
+            </Popover>
           </div>
-        );
-      }}
+      )}
     </PopupState>
   );
 }
