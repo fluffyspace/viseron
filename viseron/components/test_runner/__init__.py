@@ -148,11 +148,13 @@ def setup(vis: "Viseron", config: dict[str, Any]) -> bool:
     )
     db_cases = inject_db_cases(vis, config)
 
+    ffmpeg_cameras = config.get("ffmpeg", {}).get("camera")
     component = TestRunnerComponent(
         vis,
         block,
         yaml_cases=yaml_cases,
         db_cases=db_cases,
+        ffmpeg_cameras=ffmpeg_cameras,
     )
     vis.data[COMPONENT] = component
 

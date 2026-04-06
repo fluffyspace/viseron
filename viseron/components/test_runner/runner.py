@@ -18,8 +18,10 @@ from viseron.components.storage.models import (
     TestResult,
     TestRun,
 )
+from viseron.const import LOADED
 from viseron.domains.camera import AbstractCamera
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
+from viseron.domains import setup_domain, setup_domains
 from viseron.exceptions import DomainNotRegisteredError
 from viseron.helpers import utcnow
 
@@ -423,11 +425,13 @@ class TestRunnerComponent:
         *,
         yaml_cases: list[RunnerCase] | None = None,
         db_cases: list[RunnerCase] | None = None,
+        ffmpeg_cameras: dict[str, Any] | None = None,
     ) -> None:
         self._vis = vis
         self._config = config
         self._yaml_cases: list[RunnerCase] = yaml_cases or []
         self._db_cases: list[RunnerCase] = db_cases or []
+        self._ffmpeg_cameras = ffmpeg_cameras
         self._current_runner: "TestRunner | None" = None
         self._lock = threading.Lock()
 
@@ -447,25 +451,69 @@ class TestRunnerComponent:
         return list(self._db_cases)
 
     def refresh_db_cases(self) -> None:
-        """Reload DB cases without re-injecting ffmpeg config.
+        """Reload DB cases, injecting and registering new cameras at runtime.
 
-        Used by the REST layer so ``GET /tests/cases`` and
-        ``trigger_run`` see newly inserted cases without waiting for a
-        restart. Cases added here still require a restart to *run*
-        (their synthetic ffmpeg camera isn't registered), but the
-        pending_restart indicator picks them up immediately.
+        Used by the REST layer after a test case is created via the UI.
+        New cases get their synthetic ffmpeg camera injected into the
+        config and registered on the fly, so they become runnable
+        immediately without a Viseron restart.
         """
         storage = self._vis.data.get(STORAGE_COMPONENT)
         if storage is None:
             return
         with storage.get_session() as session:
             rows = session.execute(select(TestCase)).scalars().all()
+
+        ffmpeg_component = self._vis.data[LOADED].get("ffmpeg")
+        ffmpeg_cameras = self._ffmpeg_cameras
+
+        new_cameras_injected = False
         refreshed: list[RunnerCase] = []
         for row in rows:
             case_dict = _build_db_case_dict(row)
-            if case_dict is not None:
-                refreshed.append(case_dict)
+            if case_dict is None:
+                continue
+            refreshed.append(case_dict)
+
+            # If the synthetic camera isn't registered yet, inject it now.
+            test_camera_id = _synth_test_camera_id(
+                row.camera_identifier, row.slug
+            )
+            try:
+                self._vis.get_registered_domain(CAMERA_DOMAIN, test_camera_id)
+            except DomainNotRegisteredError:
+                if not ffmpeg_cameras or not ffmpeg_component:
+                    continue
+                target_config = ffmpeg_cameras.get(row.camera_identifier)
+                if target_config is None:
+                    continue
+                if test_camera_id not in ffmpeg_cameras:
+                    ffmpeg_cameras[test_camera_id] = _build_synthetic_camera(
+                        target_config,
+                        display_name=f"Test {row.camera_identifier} — {row.name}",
+                        file_source=row.video_path,
+                    )
+                # Register the camera domain for setup
+                pruned = {test_camera_id: ffmpeg_cameras[test_camera_id]}
+                setup_domain(
+                    self._vis,
+                    "ffmpeg",
+                    CAMERA_DOMAIN,
+                    pruned,
+                    identifier=test_camera_id,
+                )
+                new_cameras_injected = True
+                LOGGER.info(
+                    "runtime-injected test camera %r for db case %r",
+                    test_camera_id,
+                    row.name,
+                )
+
         self._db_cases = refreshed
+
+        # Set up any newly registered cameras
+        if new_cameras_injected:
+            setup_domains(self._vis)
 
     @property
     def current_runner(self) -> "TestRunner | None":
@@ -482,9 +530,9 @@ class TestRunnerComponent:
         """Union tests.yaml cases with DB cases that have live cameras.
 
         YAML cases are always runnable — their synthetic cameras were
-        registered at setup time. DB cases whose synthesized camera is
-        not yet registered (pending restart) are skipped with a clear
-        log line.
+        registered at setup time. DB cases are normally registered at
+        runtime by refresh_db_cases; any that still lack a camera are
+        skipped as a safety net.
         """
         runnable: list[RunnerCase] = list(self._yaml_cases)
         for case in self._db_cases:
@@ -492,9 +540,8 @@ class TestRunnerComponent:
             try:
                 self._vis.get_registered_domain(CAMERA_DOMAIN, camera_id)
             except DomainNotRegisteredError:
-                LOGGER.info(
-                    "skipping db case %r — camera %r is not registered "
-                    "(restart Viseron to pick it up)",
+                LOGGER.warning(
+                    "skipping db case %r — camera %r is not registered",
                     case[CONFIG_NAME],
                     camera_id,
                 )

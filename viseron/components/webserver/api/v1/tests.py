@@ -783,6 +783,15 @@ class TestsAPIHandler(BaseAPIHandler):
             return
 
         clip_path, effective_duration, case_id = result
+
+        # Register the synthetic camera at runtime so the case is
+        # immediately runnable without a Viseron restart.
+        component: "TestRunnerComponent | None" = self._vis.data.get(
+            TEST_RUNNER_COMPONENT
+        )
+        if component is not None:
+            await self.run_in_executor(component.refresh_db_cases)
+
         snippet = _yaml_snippet(
             camera_identifier=body["camera_identifier"],
             kind=body["kind"],
