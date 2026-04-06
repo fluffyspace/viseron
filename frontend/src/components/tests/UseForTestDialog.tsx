@@ -24,7 +24,7 @@ import { useMemo, useState } from "react";
 
 import { useFilteredCameras } from "components/camera/useCameraStore";
 import { useCreateTestClip } from "lib/api/tests";
-import { is12HourFormat } from "lib/helpers";
+import { is12HourFormat } from "lib/helpers/dates";
 import * as types from "lib/types";
 
 type UseForTestDialogProps = {
@@ -32,6 +32,7 @@ type UseForTestDialogProps = {
   setOpen: (open: boolean) => void;
   initialStart?: Dayjs | null;
   initialEnd?: Dayjs | null;
+  initialCamera?: string;
 };
 
 type Kind = "motion" | "object";
@@ -64,12 +65,15 @@ export function UseForTestDialog({
   setOpen,
   initialStart,
   initialEnd,
+  initialCamera,
 }: UseForTestDialogProps) {
   const [startDate, setStartDate] = useState<Dayjs | null>(
     initialStart || null,
   );
   const [endDate, setEndDate] = useState<Dayjs | null>(initialEnd || null);
-  const [cameraIdentifier, setCameraIdentifier] = useState<string>("");
+  const [cameraIdentifier, setCameraIdentifier] = useState<string>(
+    initialCamera || "",
+  );
   const [name, setName] = useState<string>("");
   const [kind, setKind] = useState<Kind>("object");
   const [polarity, setPolarity] = useState<Polarity>("positive");
@@ -128,7 +132,8 @@ export function UseForTestDialog({
     !effectiveCameraIdentifier ||
     !name.trim() ||
     endDate.isBefore(startDate) ||
-    createClip.isPending;
+    createClip.isPending ||
+    createClip.isSuccess;
 
   return (
     <Dialog fullWidth maxWidth="sm" open={open} onClose={handleClose}>
@@ -252,7 +257,7 @@ export function UseForTestDialog({
                 the <strong>Tests</strong> page and click{" "}
                 <em>Restart Viseron</em> to make the case runnable. The YAML
                 snippet below is only needed if you prefer declaring cases
-                manually in <code>config.yaml</code>:
+                manually in <code>tests.yaml</code>:
               </Alert>
               <Stack
                 direction="row"
