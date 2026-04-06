@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import signal
+import time
 from collections.abc import Callable
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -439,25 +440,31 @@ class TestsAPIHandler(BaseAPIHandler):
         slug: str,
         expected: dict[str, Any],
         case_duration: int | None,
-    ) -> tuple[str, int, int] | None:
+    ) -> tuple[str, int, int] | str:
         """Concatenate fragments for a time range, stash the clip, and
         upsert a catalog entry.
 
         Returns ``(clip_path, effective_duration, case_id)`` on success or
-        ``None`` if no fragments were found for the range.
+        an error string on failure.
         """
         files = get_time_period_fragments(
             [camera.identifier], start, end, self._get_session
         )
         if not files:
-            return None
+            return "No recorded fragments found for the requested time range"
         fragments = [
             Fragment(file.filename, file.path, file.duration, file.orig_ctime)
             for file in files
         ]
+        # Retry once — the init.mp4 file referenced by the HLS playlist is
+        # overwritten non-atomically each time a new segment is produced, so
+        # ffmpeg can fail if it reads a partially-written init file.
         tmp_path = camera.fragmenter.concatenate_fragments(fragments)
         if not tmp_path:
-            return None
+            time.sleep(0.5)
+            tmp_path = camera.fragmenter.concatenate_fragments(fragments)
+        if not tmp_path:
+            return "Failed to concatenate recorded fragments into a clip"
 
         destination = _test_clip_path(camera.identifier, kind, polarity, slug)
         create_directory(os.path.dirname(destination))
@@ -775,11 +782,8 @@ class TestsAPIHandler(BaseAPIHandler):
             body["expected"],
             body.get("duration"),
         )
-        if result is None:
-            self.response_error(
-                HTTPStatus.NOT_FOUND,
-                "No recorded fragments found for the requested time range",
-            )
+        if isinstance(result, str):
+            self.response_error(HTTPStatus.NOT_FOUND, result)
             return
 
         clip_path, effective_duration, case_id = result
