@@ -1,9 +1,8 @@
 """MQTT image entity."""
 import json
 
-import cv2
-
 from viseron.components.mqtt.helpers import PublishPayload
+from viseron.domains.camera.entity.image import CameraImage
 from viseron.helpers.entity.image import ImageEntity
 
 from . import MQTTEntity
@@ -28,31 +27,26 @@ class ImageMQTTEntity(MQTTEntity[ImageEntity]):
             f"{self.entity.object_id}/attributes"
         )
 
-    def _create_bytes_image(self):
-        """Return numpy image as jpg bytes."""
-        if self.entity.image is not None:
-            ret, jpg = cv2.imencode(".jpg", self.entity.image)
-            if ret:
-                return jpg.tobytes()
+    def _get_snapshot_url(self) -> str | None:
+        """Return the snapshot URL for the entity's camera."""
+        if isinstance(self.entity, CameraImage):
+            camera = self.entity._camera
+            return (
+                f"/api/v1/camera/{camera.identifier}"
+                f"/snapshot?access_token={camera.access_token}"
+            )
         return None
 
     def publish_state(self) -> None:
         """Publish state to MQTT."""
-        image = self._create_bytes_image()
-
-        self._mqtt.publish(
-            PublishPayload(
-                self.state_topic,
-                image,
-                retain=True,
-            )
-        )
+        snapshot_url = self._get_snapshot_url()
 
         payload = {}
+        payload["state"] = snapshot_url
         payload["attributes"] = self.entity.attributes
         self._mqtt.publish(
             PublishPayload(
-                self.attributes_topic,
+                self.state_topic,
                 json.dumps(payload),
                 retain=True,
             )

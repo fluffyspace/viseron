@@ -5,11 +5,11 @@ from typing import Final
 
 from .entity import HassMQTTEntity
 
-DOMAIN: Final = "camera"
+DOMAIN: Final = "image"
 
 
 class HassMQTTCamera(HassMQTTEntity):
-    """Base class for all Home Assistant MQTT cameras."""
+    """Base class for all Home Assistant MQTT image entities."""
 
     # These should NOT be overridden.
     domain = DOMAIN
@@ -18,7 +18,6 @@ class HassMQTTCamera(HassMQTTEntity):
     def config_payload(self):
         """Return config payload."""
         payload = super().config_payload
-        del payload["state_topic"]
-        del payload["value_template"]
-        payload["topic"] = self.state_topic
+        payload["url_topic"] = self.state_topic
+        payload["url_template"] = "{{ value_json.state }}"
         return payload
