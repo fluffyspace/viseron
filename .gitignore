@@ -133,6 +133,7 @@ scripts/deploy-lenovo.sh
 !/netlify.toml
 !/pyproject.toml
 !/README.md
+!/TESTS.md
 !tox.ini
 !/config
 # Test runner video fixtures live under /config/test_videos/<camera>/{motion,object}/{positive,negative}/
