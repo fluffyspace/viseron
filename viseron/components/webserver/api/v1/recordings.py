@@ -6,7 +6,9 @@ from http import HTTPStatus
 from typing import cast
 
 import voluptuous as vol
+from sqlalchemy import select
 
+from viseron.components.storage.models import Recordings
 from viseron.components.webserver.api.handlers import BaseAPIHandler
 from viseron.helpers.validators import request_argument_bool, request_argument_no_value
 
@@ -93,6 +95,14 @@ class RecordingsAPIHandler(BaseAPIHandler):
                     },
                 ),
             ),
+        },
+        {
+            "path_pattern": (
+                r"/recordings/(?P<camera_identifier>[A-Za-z0-9_]+)"
+                r"/(?P<recording_id>[0-9]+)/metrics"
+            ),
+            "supported_methods": ["GET"],
+            "method": "get_recording_metrics",
         },
         {  # Delete a specific recording
             "path_pattern": (
@@ -237,3 +247,27 @@ class RecordingsAPIHandler(BaseAPIHandler):
             ),
         )
         return
+
+    @staticmethod
+    def _query_metrics(
+        get_session, camera_identifier: str, recording_id: int
+    ) -> dict | None:
+        with get_session() as session:
+            return session.execute(
+                select(Recordings.detection_metrics).where(
+                    Recordings.id == recording_id,
+                    Recordings.camera_identifier == camera_identifier,
+                )
+            ).scalar_one_or_none()
+
+    async def get_recording_metrics(
+        self, camera_identifier: str, recording_id: str
+    ) -> None:
+        """Get detection metrics for a recording."""
+        metrics = await self.run_in_executor(
+            self._query_metrics,
+            self._get_session,
+            camera_identifier,
+            int(recording_id),
+        )
+        await self.response_success(response={"metrics": metrics})

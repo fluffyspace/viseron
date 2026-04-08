@@ -8,6 +8,7 @@ import { useShallow } from "zustand/react/shallow";
 
 import { CameraNameOverlay } from "components/camera/CameraNameOverlay";
 import { useFilteredCameras } from "components/camera/useCameraStore";
+import { DetectionMetricsOverlay } from "components/events/DetectionMetricsOverlay";
 import SyncManager from "components/events/SyncManager";
 import {
   LIVE_EDGE_DELAY,
@@ -21,6 +22,7 @@ import { PlayerGrid } from "components/player/grid/PlayerGrid";
 import { useVideoControls } from "components/player/hooks/useVideoControls";
 import VideoPlayerPlaceholder from "components/player/videoplayer/VideoPlayerPlaceholder";
 import { useCamerasAll } from "lib/api/cameras";
+import { useRecordingMetrics } from "lib/api/recordingMetrics";
 import { isTouchDevice } from "lib/helpers";
 import * as types from "lib/types";
 
@@ -236,11 +238,27 @@ export function PlayerCard() {
 
   const filteredCameras = useFilteredCameras();
 
-  const { requestedTimestamp } = useReferencePlayerStore(
-    useShallow((state) => ({
-      requestedTimestamp: state.requestedTimestamp,
-    })),
+  const { requestedTimestamp, setRequestedTimestamp, playingDateRef } =
+    useReferencePlayerStore(
+      useShallow((state) => ({
+        requestedTimestamp: state.requestedTimestamp,
+        setRequestedTimestamp: state.setRequestedTimestamp,
+        playingDateRef: state.playingDateRef,
+      })),
+    );
+
+  // Fetch detection metrics for recording events
+  const isRecordingEvent =
+    selectedEvent && "type" in selectedEvent && selectedEvent.type === "recording";
+  const recordingEvent = isRecordingEvent
+    ? (selectedEvent as types.CameraRecordingEvent)
+    : null;
+  const { data: metricsData } = useRecordingMetrics(
+    recordingEvent?.camera_identifier ?? null,
+    recordingEvent?.id ?? null,
   );
+  const recordingDurationMs =
+    recordingEvent?.duration != null ? recordingEvent.duration * 1000 : 0;
 
   const renderPlayer = useCallback(
     (camera: types.Camera | types.FailedCamera) => (
@@ -305,6 +323,15 @@ export function PlayerCard() {
                 <CameraNameOverlay camera_identifier={camera.identifier} />
               </>
             )
+          )}
+          {metricsData && recordingEvent && recordingDurationMs > 0 && (
+            <DetectionMetricsOverlay
+              metrics={metricsData}
+              durationMs={recordingDurationMs}
+              startTimestamp={recordingEvent.start_timestamp}
+              playingDateRef={playingDateRef}
+              onSeek={setRequestedTimestamp}
+            />
           )}
         </Box>
         <CustomControls

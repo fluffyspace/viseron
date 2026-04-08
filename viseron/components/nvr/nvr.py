@@ -16,10 +16,13 @@ from enum import Enum
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Literal
 
+from sqlalchemy import update
+
 from viseron.components.nvr.const import COMPONENT
 from viseron.components.nvr.sensor import OperationStateSensor
 from viseron.components.nvr.toggle import ManualRecordingToggle
-from viseron.components.storage.models import TriggerTypes
+from viseron.components.storage.const import COMPONENT as STORAGE_COMPONENT
+from viseron.components.storage.models import Recordings, TriggerTypes
 from viseron.const import VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.domains.motion_detector import AbstractMotionDetectorScanner
@@ -253,6 +256,60 @@ class OperationState(Enum):
     ERROR_SCANNING_FRAME = "error_scanning_frame"
 
 
+class RecordingMetricsAccumulator:
+    """Accumulate detection metrics during a recording."""
+
+    def __init__(self, recording_start_time: datetime.datetime) -> None:
+        self._start_time = recording_start_time
+        self._motion_samples: list[list] = []
+        self._motion_events: list[list] = []
+        self._object_samples: list[list] = []
+        self._motion_event_start: int | None = None
+
+    def _offset_ms(self, timestamp: datetime.datetime) -> int:
+        return int((timestamp - self._start_time).total_seconds() * 1000)
+
+    def add_motion_sample(
+        self,
+        timestamp: datetime.datetime,
+        max_area: float,
+        motion_detected: bool,
+    ) -> None:
+        """Add a motion detection sample."""
+        offset = self._offset_ms(timestamp)
+        self._motion_samples.append([offset, min(round(max_area * 100, 1), 100)])
+        if motion_detected and self._motion_event_start is None:
+            self._motion_event_start = offset
+        elif not motion_detected and self._motion_event_start is not None:
+            self._motion_events.append([self._motion_event_start, offset])
+            self._motion_event_start = None
+
+    def add_object_samples(
+        self,
+        timestamp: datetime.datetime,
+        objects: list[DetectedObject],
+    ) -> None:
+        """Add object detection samples."""
+        offset = self._offset_ms(timestamp)
+        for obj in objects:
+            self._object_samples.append([offset, obj.label, round(obj.confidence, 2)])
+
+    def finalize(self) -> dict:
+        """Finalize and return the accumulated metrics."""
+        if self._motion_event_start is not None and self._motion_samples:
+            self._motion_events.append(
+                [self._motion_event_start, self._motion_samples[-1][0]]
+            )
+        return {
+            "version": 1,
+            "motion": {
+                "samples": self._motion_samples,
+                "events": self._motion_events,
+            },
+            "objects": {"samples": self._object_samples},
+        }
+
+
 class NVR(AbstractNVR):
     """NVR class that orchestrates all handling of camera streams."""
 
@@ -281,6 +338,7 @@ class NVR(AbstractNVR):
         self._kill_received = False
         self._removal_timers: list[threading.Timer] = []
         self._operation_state: OperationState | None = None
+        self._metrics_accumulator: RecordingMetricsAccumulator | None = None
 
         self._frame_scanners: dict[str, FrameIntervalCalculator] = {}
         self._current_frame_scanners: dict[str, FrameIntervalCalculator] = {}
@@ -736,6 +794,10 @@ class NVR(AbstractNVR):
             self._object_detector.objects_in_fov if self._object_detector else None,
             trigger_type,
         )
+        if self._camera.recorder.active_recording:
+            self._metrics_accumulator = RecordingMetricsAccumulator(
+                self._camera.recorder.active_recording.start_time
+            )
 
         if (
             self._motion_detector
@@ -745,12 +807,35 @@ class NVR(AbstractNVR):
             self._frame_scanners[MOTION_DETECTOR].scan = True
             self._logger.info("Starting motion detector")
 
+    def _save_detection_metrics(self) -> None:
+        """Save accumulated detection metrics to the recording."""
+        if not self._metrics_accumulator:
+            return
+        recording = self._camera.recorder.active_recording
+        if not recording:
+            self._metrics_accumulator = None
+            return
+        metrics = self._metrics_accumulator.finalize()
+        self._metrics_accumulator = None
+        try:
+            storage = self._vis.data[STORAGE_COMPONENT]
+            with storage.get_session() as session:
+                session.execute(
+                    update(Recordings)
+                    .where(Recordings.id == recording.id)
+                    .values(detection_metrics=metrics)
+                )
+                session.commit()
+        except Exception:
+            self._logger.exception("Failed to save detection metrics")
+
     def stop_recorder(self, *, force: bool = False) -> None:
         """Stop recorder."""
 
         def _stop() -> None:
             self._stop_recorder_at = None
             self._seconds_left = 0
+            self._save_detection_metrics()
             self._camera.stop_recorder()
 
         if force:
@@ -869,6 +954,20 @@ class NVR(AbstractNVR):
 
         self.process_frame(shared_frame)
         self.process_recorder(shared_frame)
+        if self._camera.is_recording and self._metrics_accumulator:
+            now = utcnow()
+            if self._motion_detector:
+                self._metrics_accumulator.add_motion_sample(
+                    now,
+                    self._motion_detector.motion_contours.max_area
+                    if self._motion_detector.motion_contours
+                    else 0.0,
+                    self._motion_detector.motion_detected,
+                )
+            if self._object_detector and self._object_detector.objects_in_fov:
+                self._metrics_accumulator.add_object_samples(
+                    now, self._object_detector.objects_in_fov
+                )
         self._vis.dispatch_event(
             EVENT_PROCESSED_FRAME_TOPIC.format(
                 camera_identifier=self._camera.identifier

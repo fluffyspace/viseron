@@ -199,6 +199,7 @@ class Recordings(Base):
     test: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=expression.false()
     )
+    detection_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     def get_fragments(
         self, lookback: float, get_session: Callable[[], Session], now=None
