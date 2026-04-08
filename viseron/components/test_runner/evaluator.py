@@ -132,6 +132,31 @@ def evaluate_object(
     if expected_labels is not None:
         expected_labels = list(expected_labels)
 
+    want_detected = bool(expected.get(EXPECTED_DETECTED, True))
+
+    # Negative case with specific labels: those labels should NOT appear.
+    if expected_labels and not want_detected:
+        found = [label for label in expected_labels if label in observed_labels]
+        passed = not found
+        actual = {"labels": observed_labels, "count": len(rows)}
+        if passed:
+            message = (
+                f"none of the non-expected labels appeared: "
+                f"{sorted(expected_labels)}"
+            )
+        else:
+            message = (
+                f"non-expected labels were detected: {sorted(found)} "
+                f"(observed: {sorted(observed_labels.keys())})"
+            )
+        return CaseOutcome(
+            passed=passed,
+            actual=actual,
+            message=message,
+            snapshot_path=snapshot_path,
+        )
+
+    # Positive case with labels: every listed label must appear at least once.
     if expected_labels:
         missing = [label for label in expected_labels if label not in observed_labels]
         passed = not missing
@@ -150,7 +175,6 @@ def evaluate_object(
             snapshot_path=snapshot_path,
         )
 
-    want_detected = bool(expected.get(EXPECTED_DETECTED, True))
     got_detected = bool(rows)
     actual = {
         "detected": got_detected,

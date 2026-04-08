@@ -48,7 +48,14 @@ function buildExpected(
   }
   // kind === "object"
   if (polarity === "negative") {
-    return { detected: false };
+    const trimmedLabels = labels
+      .split(",")
+      .map((label) => label.trim())
+      .filter((label) => label.length > 0);
+    if (trimmedLabels.length === 0) {
+      return { detected: false };
+    }
+    return { detected: false, labels: trimmedLabels };
   }
   const trimmedLabels = labels
     .split(",")
@@ -228,9 +235,10 @@ export function UseForTestDialog({
             <RadioGroup
               row
               value={polarity}
-              onChange={(event) =>
-                setPolarity(event.target.value as Polarity)
-              }
+              onChange={(event) => {
+                setPolarity(event.target.value as Polarity);
+                setLabels("");
+              }}
             >
               <FormControlLabel
                 value="positive"
@@ -252,6 +260,17 @@ export function UseForTestDialog({
               value={labels}
               onChange={(event) => setLabels(event.target.value)}
               helperText="e.g. 'person, car'"
+              fullWidth
+            />
+          )}
+
+          {kind === "object" && polarity === "negative" && (
+            <TextField
+              label="Non-expected labels (comma separated)"
+              size="small"
+              value={labels}
+              onChange={(event) => setLabels(event.target.value)}
+              helperText="Objects that should NOT be detected, e.g. 'person, car'. Leave empty for 'no objects at all'."
               fullWidth
             />
           )}
