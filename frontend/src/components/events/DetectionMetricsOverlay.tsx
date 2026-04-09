@@ -24,7 +24,7 @@ function getLabelColor(label: string): string {
   if (LABEL_COLORS[label]) return LABEL_COLORS[label];
   let hash = 0;
   for (let i = 0; i < label.length; i++) {
-    hash = label.charCodeAt(i) + ((hash << 5) - hash);
+    hash = label.charCodeAt(i) + ((hash << 5) - hash); // eslint-disable-line no-bitwise
   }
   const hue = Math.abs(hash) % 360;
   return `hsl(${hue}, 70%, 60%)`;
@@ -132,7 +132,7 @@ export function DetectionMetricsOverlay({
   useLayoutEffect(() => {
     const container = containerRef.current;
     const canvas = canvasRef.current;
-    if (!container || !canvas) return;
+    if (!container || !canvas) return undefined;
 
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -152,15 +152,15 @@ export function DetectionMetricsOverlay({
       }
     });
     observer.observe(container);
-    return () => observer.disconnect();
+    return () => { observer.disconnect(); };
   }, [drawStatic]);
 
   // Animation loop — reads playingDateRef directly, no re-renders needed
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || durationMs <= 0) return;
+    if (!canvas || durationMs <= 0) return undefined;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    if (!ctx) return undefined;
 
     let running = true;
     const loop = () => {
@@ -209,10 +209,7 @@ export function DetectionMetricsOverlay({
       animFrameRef.current = requestAnimationFrame(loop);
     };
     animFrameRef.current = requestAnimationFrame(loop);
-    return () => {
-      running = false;
-      cancelAnimationFrame(animFrameRef.current);
-    };
+    return () => { running = false; cancelAnimationFrame(animFrameRef.current); };
   }, [durationMs, startTimestamp, playingDateRef, theme.palette.mode]);
 
   const handleClick = useCallback(
