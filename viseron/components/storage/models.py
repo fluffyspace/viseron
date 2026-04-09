@@ -313,6 +313,27 @@ class PostProcessorResults(Base):
     )
 
 
+class EventFrames(Base):
+    """Database model for per-frame tracking data during event recordings."""
+
+    __tablename__ = "event_frames"
+
+    __table_args__ = (
+        Index("idx_event_frames_recording", "recording_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    recording_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("recordings.id", ondelete="CASCADE"), nullable=False
+    )
+    frame_offset_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    motion_area: Mapped[float | None] = mapped_column(Float, nullable=True)
+    objects: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
+    )
+
+
 class Events(Base):
     """Database model for dispatched events."""
 

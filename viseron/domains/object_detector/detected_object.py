@@ -52,6 +52,7 @@ class DetectedObject:
         self._store = False
         self._relevant = False
         self._filter_hit = None
+        self._track_id: int | None = None
 
     @classmethod
     def from_relative(
@@ -219,6 +220,8 @@ class DetectedObject:
         payload["rel_y1"] = self.rel_y1
         payload["rel_x2"] = self.rel_x2
         payload["rel_y2"] = self.rel_y2
+        if self._track_id is not None:
+            payload["track_id"] = self._track_id
         return payload
 
     @property
@@ -260,6 +263,15 @@ class DetectedObject:
     @filter_hit.setter
     def filter_hit(self, value) -> None:
         self._filter_hit = value
+
+    @property
+    def track_id(self) -> int | None:
+        """Return the tracking ID assigned by the object tracker."""
+        return self._track_id
+
+    @track_id.setter
+    def track_id(self, value: int | None) -> None:
+        self._track_id = value
 
     def as_dict(self) -> dict[str, Any]:
         """Convert to dict."""

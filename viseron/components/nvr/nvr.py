@@ -16,13 +16,14 @@ from enum import Enum
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Literal
 
-from sqlalchemy import update
+from sqlalchemy import insert, update
 
 from viseron.components.nvr.const import COMPONENT
 from viseron.components.nvr.sensor import OperationStateSensor
 from viseron.components.nvr.toggle import ManualRecordingToggle
+from viseron.components.object_tracker.const import DATA_OBJECT_TRACKER
 from viseron.components.storage.const import COMPONENT as STORAGE_COMPONENT
-from viseron.components.storage.models import Recordings, TriggerTypes
+from viseron.components.storage.models import EventFrames, Recordings, TriggerTypes
 from viseron.const import VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.domains.motion_detector import AbstractMotionDetectorScanner
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
     import numpy as np
 
     from viseron import Viseron
+    from viseron.components.object_tracker.tracker import ObjectTracker
     from viseron.domains.camera import AbstractCamera, EventFrameBytesData
     from viseron.domains.camera.recorder import ManualRecording
     from viseron.domains.camera.shared_frames import SharedFrame
@@ -90,7 +92,9 @@ def setup(vis: Viseron, config: dict[str, Any], identifier: str) -> bool:
         except DomainNotRegisteredError:
             motion_detector = False
 
-    NVR(vis, config, identifier, object_detector, motion_detector)
+    object_tracker = vis.data.get(DATA_OBJECT_TRACKER, {}).get(identifier)
+
+    NVR(vis, config, identifier, object_detector, motion_detector, object_tracker)
 
     return True
 
@@ -320,6 +324,7 @@ class NVR(AbstractNVR):
         camera_identifier: str,
         object_detector: AbstractObjectDetector | Literal[False],
         motion_detector: AbstractMotionDetector | Literal[False],
+        object_tracker: ObjectTracker | None = None,
     ) -> None:
         super().__init__(vis, config, camera_identifier)
         self._camera: AbstractCamera = vis.get_registered_domain(
@@ -339,6 +344,9 @@ class NVR(AbstractNVR):
         self._removal_timers: list[threading.Timer] = []
         self._operation_state: OperationState | None = None
         self._metrics_accumulator: RecordingMetricsAccumulator | None = None
+        self._object_tracker = object_tracker
+        self._event_frames_buffer: list[dict] = []
+        self._storage = vis.data[STORAGE_COMPONENT]
 
         self._frame_scanners: dict[str, FrameIntervalCalculator] = {}
         self._current_frame_scanners: dict[str, FrameIntervalCalculator] = {}
@@ -829,6 +837,19 @@ class NVR(AbstractNVR):
         except Exception:
             self._logger.exception("Failed to save detection metrics")
 
+    def _flush_event_frames(self) -> None:
+        """Flush buffered event frame rows to the database."""
+        if not self._event_frames_buffer:
+            return
+        rows = self._event_frames_buffer
+        self._event_frames_buffer = []
+        try:
+            with self._storage.get_session() as session:
+                session.execute(insert(EventFrames), rows)
+                session.commit()
+        except Exception:
+            self._logger.exception("Failed to flush event frames")
+
     def stop_recorder(self, *, force: bool = False) -> None:
         """Stop recorder."""
 
@@ -836,6 +857,9 @@ class NVR(AbstractNVR):
             self._stop_recorder_at = None
             self._seconds_left = 0
             self._save_detection_metrics()
+            self._flush_event_frames()
+            if self._object_tracker:
+                self._object_tracker.reset()
             self._camera.stop_recorder()
 
         if force:
@@ -968,6 +992,57 @@ class NVR(AbstractNVR):
                 self._metrics_accumulator.add_object_samples(
                     now, self._object_detector.objects_in_fov
                 )
+        if (
+            self._camera.is_recording
+            and self._camera.recorder.active_recording
+        ):
+            recording = self._camera.recorder.active_recording
+            offset_ms = int(
+                (utcnow() - recording.start_time).total_seconds() * 1000
+            )
+            # Use tracked objects if tracker is available, else raw detections
+            objects_list = None
+            if self._object_tracker and self._object_tracker.tracked_objects:
+                objects_list = [
+                    {
+                        "track_id": obj.track_id,
+                        "label": obj.label,
+                        "confidence": round(obj.confidence, 2),
+                        "box": [
+                            obj.rel_x1, obj.rel_y1, obj.rel_x2, obj.rel_y2,
+                        ],
+                    }
+                    for obj in self._object_tracker.tracked_objects
+                ]
+            elif (
+                self._object_detector
+                and self._object_detector.objects_in_fov
+            ):
+                objects_list = [
+                    {
+                        "label": obj.label,
+                        "confidence": round(obj.confidence, 2),
+                        "box": [
+                            obj.rel_x1, obj.rel_y1, obj.rel_x2, obj.rel_y2,
+                        ],
+                    }
+                    for obj in self._object_detector.objects_in_fov
+                ]
+            motion_area = None
+            if self._motion_detector and self._motion_detector.motion_contours:
+                motion_area = round(
+                    self._motion_detector.motion_contours.max_area, 4
+                )
+            self._event_frames_buffer.append(
+                {
+                    "recording_id": recording.id,
+                    "frame_offset_ms": offset_ms,
+                    "motion_area": motion_area,
+                    "objects": objects_list,
+                }
+            )
+            if len(self._event_frames_buffer) >= 30:
+                self._flush_event_frames()
         self._vis.dispatch_event(
             EVENT_PROCESSED_FRAME_TOPIC.format(
                 camera_identifier=self._camera.identifier
