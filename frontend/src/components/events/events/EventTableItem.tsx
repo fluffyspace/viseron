@@ -57,6 +57,14 @@ function EventTableItemIcons({ sortedEvents }: EventTableItemIconsProps) {
         {timeStr}
         {durationSeconds !== null && ` (${formatDuration(durationSeconds)})`}
       </Typography>
+      <Typography
+        fontSize=".65rem"
+        color="text.secondary"
+        align="center"
+        sx={{ fontFamily: "monospace" }}
+      >
+        #{headlineEvent.id}
+      </Typography>
       <Grid container justifyContent="center" alignItems="center">
         {Object.keys(uniqueEvents).map((key) => {
           // For object detection we want to group by label
