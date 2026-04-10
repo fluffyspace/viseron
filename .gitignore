@@ -67,6 +67,8 @@
 # Source
 !/viseron
 !/viseron/*
+!/viseron/assets
+!/viseron/assets/**
 !/viseron/components
 !/viseron/components/**
 !/viseron/domains

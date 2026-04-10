@@ -53,6 +53,7 @@ from .const import (
     CONFIG_PASSWORD,
     CONFIG_PATH,
     CONFIG_PIX_FMT,
+    CONFIG_PLAYBACK_MODE,
     CONFIG_PORT,
     CONFIG_PROTOCOL,
     CONFIG_RAW_COMMAND,
@@ -86,6 +87,7 @@ from .const import (
     DEFAULT_INPUT_ARGS,
     DEFAULT_PASSWORD,
     DEFAULT_PIX_FMT,
+    DEFAULT_PLAYBACK_MODE,
     DEFAULT_PROTOCOL,
     DEFAULT_RAW_COMMAND,
     DEFAULT_RECORD_ONLY,
@@ -117,6 +119,7 @@ from .const import (
     DESC_PASSWORD,
     DESC_PATH,
     DESC_PIX_FMT,
+    DESC_PLAYBACK_MODE,
     DESC_PORT,
     DESC_PROTOCOL,
     DESC_RAW_COMMAND,
@@ -318,12 +321,60 @@ CAMERA_SCHEMA = _camera_schema_with_stream.extend(
             default=DEFAULT_TEST_MODE,
             description=DESC_TEST_MODE,
         ): bool,
+        vol.Optional(
+            CONFIG_PLAYBACK_MODE,
+            default=DEFAULT_PLAYBACK_MODE,
+            description=DESC_PLAYBACK_MODE,
+        ): bool,
     }
 )
 
+
+def _validate_playback_camera(config: dict[str, Any]) -> dict[str, Any]:
+    """Reject incompatible options on playback cameras.
+
+    Playback cameras dynamically swap their input file via the playback API.
+    A few features break that lifecycle and must be rejected up front:
+
+    - ``substream``: the substream's segment process is started with
+      ``register=True``, so the watchdog will auto-restart it after EOF
+      and defeat the playback stop logic.
+    - ``raw_command``: bypasses the ``file_source`` plumbing entirely.
+    - ``record_only``: skips the detection pipeline, which is the whole
+      point of playback.
+    - ``file_source``: required (we need an initial path to bootstrap the
+      Stream's ffprobe step).
+    """
+    if not config.get(CONFIG_PLAYBACK_MODE):
+        return config
+    if config.get(CONFIG_SUBSTREAM):
+        raise vol.Invalid(
+            "playback_mode cameras cannot use substream. The substream's "
+            "segment process auto-restarts on EOF, which conflicts with the "
+            "playback stop lifecycle."
+        )
+    if config.get(CONFIG_RAW_COMMAND):
+        raise vol.Invalid(
+            "playback_mode cameras cannot use raw_command. raw_command "
+            "bypasses the file_source plumbing required for playback."
+        )
+    if config.get(CONFIG_RECORD_ONLY):
+        raise vol.Invalid(
+            "playback_mode cameras cannot use record_only. The detection "
+            "pipeline is required for playback."
+        )
+    if not config.get(CONFIG_FILE_SOURCE):
+        raise vol.Invalid(
+            "playback_mode cameras must declare an initial file_source. "
+            "It is used as a bootstrap fixture for ffprobe at boot; the "
+            "actual replay file is set at runtime via the playback API."
+        )
+    return config
+
+
 CONFIG_SCHEMA = vol.Schema(
     {
-        CameraIdentifier(): CAMERA_SCHEMA,
+        CameraIdentifier(): vol.All(CAMERA_SCHEMA, _validate_playback_camera),
     }
 )
 
@@ -649,3 +700,8 @@ class Camera(AbstractCamera):
     def is_test_camera(self) -> bool:
         """Return True if this camera is a test-runner camera."""
         return bool(self._config.get(CONFIG_TEST_MODE, False))
+
+    @property
+    def is_playback_camera(self) -> bool:
+        """Return True if this camera is a playback camera."""
+        return bool(self._config.get(CONFIG_PLAYBACK_MODE, False))

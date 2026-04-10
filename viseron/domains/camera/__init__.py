@@ -246,6 +246,7 @@ class AbstractCamera(AbstractDomain):
             "continuous_recording": self._config[CONFIG_RECORDER][
                 CONFIG_CONTINUOUS_RECORDING
             ],
+            "is_playback_camera": self.is_playback_camera,
         }
 
     def generate_token(self) -> str:
@@ -335,6 +336,19 @@ class AbstractCamera(AbstractDomain):
         configurations can be validated. All motion/object/recording rows
         they produce are written with test=True so they do not mix with
         live events in the regular UI.
+        """
+        return False
+
+    @property
+    def is_playback_camera(self) -> bool:
+        """Return True if this camera is a playback camera.
+
+        Playback cameras are interactive replay cameras: they do not
+        auto-start at boot, and their input file_source is set at runtime
+        via the playback API. From the perspective of every other
+        component (motion/object detectors, NVR, recorder, MQTT, the
+        Events view) they are indistinguishable from a real RTSP camera —
+        only the auto-start gate behaves differently.
         """
         return False
 

@@ -212,6 +212,7 @@ CONFIG_RECORDER = "recorder"
 CONFIG_RAW_COMMAND = "raw_command"
 CONFIG_RECORD_ONLY = "record_only"
 CONFIG_TEST_MODE = "test_mode"
+CONFIG_PLAYBACK_MODE = "playback_mode"
 
 DEFAULT_USERNAME: Final = None
 DEFAULT_PASSWORD: Final = None
@@ -231,6 +232,7 @@ DEFAULT_FFPROBE_LOGLEVEL = "error"
 DEFAULT_RAW_COMMAND: Final = None
 DEFAULT_RECORD_ONLY = False
 DEFAULT_TEST_MODE = False
+DEFAULT_PLAYBACK_MODE = False
 
 DESC_CAMERA = "Camera domain config."
 DESC_HOST = "IP or hostname of camera."
@@ -273,4 +275,11 @@ DESC_TEST_MODE = (
     "Mark this camera as a test-runner camera. Detections produced by cameras "
     "with this flag set are written with the <code>test</code> flag and do not "
     "appear in the regular Events view."
+)
+DESC_PLAYBACK_MODE = (
+    "Mark this camera as a playback camera. The camera does not auto-start at "
+    "boot; its <code>file_source</code> is set at runtime via the playback API. "
+    "Treated as a normal camera in every other respect (MQTT publishes, "
+    "recordings are written with <code>test=False</code>, motion/object/recording "
+    "rows appear in the regular Events view, NVR triggers normally)."
 )

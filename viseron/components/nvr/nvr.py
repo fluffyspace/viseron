@@ -421,7 +421,10 @@ class NVR(AbstractNVR):
             vis.register_signal_handler(VISERON_SIGNAL_SHUTDOWN, self.stop)
         )
 
-        if not self._camera.is_test_camera:
+        # Test cameras are driven by the test runner; playback cameras are
+        # driven by the playback API. In both cases NVR must not auto-start
+        # the underlying ffmpeg process.
+        if not self._camera.is_test_camera and not self._camera.is_playback_camera:
             self._camera.start_camera()
         self._logger.info(f"NVR for camera {self._camera.name} initialized")
 
