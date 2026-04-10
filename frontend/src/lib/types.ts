@@ -191,6 +191,7 @@ export interface Camera {
   connected: boolean;
   live_stream_available: boolean;
   is_recording: boolean;
+  continuous_recording: boolean;
 }
 
 export interface Cameras {

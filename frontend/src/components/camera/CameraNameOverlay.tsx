@@ -28,23 +28,26 @@ const cameraNameStyles: SxProps<Theme> = {
 };
 
 function StatusIcon({ camera }: { camera: types.Camera }) {
-  return camera.is_on ? (
+  if (!camera.is_on) {
+    return (
+      <VideoOff
+        size={12}
+        style={{
+          color: "white",
+          marginLeft: "4px",
+        }}
+      />
+    );
+  }
+
+  const recordingToDisk =
+    camera.is_recording || (camera.continuous_recording && camera.connected);
+
+  return (
     <CircleFill
       size={12}
       style={{
-        color: camera.is_recording
-          ? "red"
-          : camera.connected
-            ? "green"
-            : "gray",
-        marginLeft: "4px",
-      }}
-    />
-  ) : (
-    <VideoOff
-      size={12}
-      style={{
-        color: "white",
+        color: recordingToDisk ? "red" : camera.connected ? "green" : "gray",
         marginLeft: "4px",
       }}
     />
@@ -64,12 +67,12 @@ export function CameraNameOverlay({
   let statusText = null;
   if (camera.failed) {
     statusText = "Camera error";
-  } else if (camera.is_recording) {
-    statusText = "Recording";
   } else if (!camera.is_on) {
     statusText = "Camera is off";
   } else if (!camera.connected) {
     statusText = "Disconnected";
+  } else if (camera.is_recording || camera.continuous_recording) {
+    statusText = "Recording";
   } else {
     statusText = null;
   }

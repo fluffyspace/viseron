@@ -52,9 +52,11 @@ from viseron.helpers.logs import (
 from viseron.viseron_types import SnapshotDomain
 
 from .const import (
+    CONFIG_CONTINUOUS_RECORDING,
     CONFIG_MJPEG_STREAMS,
     CONFIG_NAME,
     CONFIG_PASSWORD,
+    CONFIG_RECORDER,
     CONFIG_REFRESH_INTERVAL,
     CONFIG_STILL_IMAGE,
     CONFIG_STILL_IMAGE_HEIGHT,
@@ -241,6 +243,9 @@ class AbstractCamera(AbstractDomain):
             "connected": self.connected,
             "live_stream_available": self.live_stream_available,
             "is_recording": self.is_recording,
+            "continuous_recording": self._config[CONFIG_RECORDER][
+                CONFIG_CONTINUOUS_RECORDING
+            ],
         }
 
     def generate_token(self) -> str:

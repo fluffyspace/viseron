@@ -39,6 +39,7 @@ const mockCamera: types.Camera = {
   connected: true,
   live_stream_available: true,
   is_recording: false,
+  continuous_recording: false,
 };
 
 describe("sortObj", () => {
