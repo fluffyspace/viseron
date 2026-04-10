@@ -832,12 +832,19 @@ export const useSelectEvent = () => {
   );
 
   const selectEvent = useCallback(
-    (event: types.CameraEvent) => {
-      const eventTimestamp = Math.round(getEventTimestamp(event));
-      if (isTimespanAvailable(eventTimestamp, availableTimespansRef.current)) {
+    (event: types.CameraEvent, seekTo?: number) => {
+      // When seekTo is provided, the caller is asking us to land playback at a
+      // specific moment inside `event` (e.g. an object snapshot inside its
+      // parent recording). In that case the click is precise — don't apply
+      // the lookback offset that we use for "play this event from the start".
+      const explicitSeek = seekTo != null;
+      const seekTimestamp = Math.round(
+        explicitSeek ? seekTo : getEventTimestamp(event),
+      );
+      if (isTimespanAvailable(seekTimestamp, availableTimespansRef.current)) {
         setSelectedEvent(event);
         setRequestedTimestamp(
-          eventTimestamp - (lookbackAdjust ? event.lookback : 0),
+          seekTimestamp - (!explicitSeek && lookbackAdjust ? event.lookback : 0),
         );
         return;
       }
@@ -853,6 +860,31 @@ export const useSelectEvent = () => {
     ],
   );
   return selectEvent;
+};
+
+// When the user clicks a grouped row card or an individual snapshot inside a
+// group, we want to prefer the recording event (if any) as the "primary"
+// selection, because the recording is the only event type with a playable
+// video and the per-frame motion/object timeline graph. The originally
+// clicked event (if it was a snapshot inside the recording) becomes a seek
+// hint so the player jumps to that exact moment.
+export const resolveGroupSelection = (
+  clickedEvent: types.CameraEvent,
+  group: types.CameraEvent[],
+): { primary: types.CameraEvent; seekTo?: number } => {
+  if (clickedEvent.type === "recording") {
+    return { primary: clickedEvent };
+  }
+  const recording = group.find(
+    (e): e is types.CameraRecordingEvent => e.type === "recording",
+  );
+  if (!recording) {
+    return { primary: clickedEvent };
+  }
+  return {
+    primary: recording,
+    seekTo: getEventTimestamp(clickedEvent),
+  };
 };
 
 const labelToIcon = (label: string) => {

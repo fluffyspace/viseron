@@ -1,7 +1,7 @@
 """Add event_frames table.
 
 Revision ID: b5e9f2a1c3d7
-Revises: a3e8f1b2c4d5
+Revises: d4f09a7b3e12
 Create Date: 2026-04-09 12:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 # revision identifiers, used by Alembic.
 revision: str | None = "b5e9f2a1c3d7"
-down_revision: str | None = "a3e8f1b2c4d5"
+down_revision: str | None = "d4f09a7b3e12"
 branch_labels: str | None = None
 depends_on: str | None = None
 

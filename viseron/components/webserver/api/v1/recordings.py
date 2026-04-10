@@ -8,7 +8,7 @@ from typing import cast
 import voluptuous as vol
 from sqlalchemy import select
 
-from viseron.components.storage.models import Recordings
+from viseron.components.storage.models import EventFrames, Recordings
 from viseron.components.webserver.api.handlers import BaseAPIHandler
 from viseron.helpers.validators import request_argument_bool, request_argument_no_value
 
@@ -252,13 +252,41 @@ class RecordingsAPIHandler(BaseAPIHandler):
     def _query_metrics(
         get_session, camera_identifier: str, recording_id: int
     ) -> dict | None:
+        """Build detection metrics from event_frames rows."""
         with get_session() as session:
-            return session.execute(
-                select(Recordings.detection_metrics).where(
+            # Verify recording belongs to this camera
+            rec = session.execute(
+                select(Recordings.id).where(
                     Recordings.id == recording_id,
                     Recordings.camera_identifier == camera_identifier,
                 )
             ).scalar_one_or_none()
+            if rec is None:
+                return None
+
+            rows = session.execute(
+                select(
+                    EventFrames.frame_offset_ms,
+                    EventFrames.motion_area,
+                    EventFrames.objects,
+                )
+                .where(EventFrames.recording_id == recording_id)
+                .order_by(EventFrames.frame_offset_ms)
+            ).all()
+
+        if not rows:
+            return None
+
+        frames: list[dict] = []
+        for offset_ms, motion_area, objects in rows:
+            frame: dict = {"t": offset_ms}
+            if motion_area is not None:
+                frame["m"] = round(motion_area * 100, 1)
+            if objects:
+                frame["o"] = objects
+            frames.append(frame)
+
+        return {"version": 2, "frames": frames}
 
     async def get_recording_metrics(
         self, camera_identifier: str, recording_id: str

@@ -28,6 +28,7 @@ import {
   getEventTimestamp,
   getIcon,
   getSrc,
+  resolveGroupSelection,
   useFilterStore,
   useScrollingStore,
   useSelectEvent,
@@ -137,7 +138,13 @@ const getTooltipTitle = (event: types.CameraEvent) => {
   }
 };
 
-function PopoverContent({ events }: { events: types.CameraEvent[] }) {
+function PopoverContent({
+  events,
+  parentGroup,
+}: {
+  events: types.CameraEvent[];
+  parentGroup?: types.CameraEvent[];
+}) {
   const theme = useTheme();
   const matches = useMediaQuery(theme.breakpoints.up("sm"));
   const width = matches ? (events.length > 1 ? "50vw" : "25vw") : "90vw";
@@ -164,7 +171,15 @@ function PopoverContent({ events }: { events: types.CameraEvent[] }) {
             <Card>
               <CardActionArea
                 onClick={() => {
-                  handleEventClick(event);
+                  // If this snapshot lives inside a recording group, prefer
+                  // the recording as the selected event so the timeline graph
+                  // shows up, and pass the snapshot's timestamp as a seek
+                  // hint so playback lands on the exact moment the user
+                  // clicked.
+                  const { primary, seekTo } = parentGroup
+                    ? resolveGroupSelection(event, parentGroup)
+                    : { primary: event, seekTo: undefined };
+                  handleEventClick(primary, seekTo);
                 }}
               >
                 <CardMedia
@@ -223,7 +238,13 @@ function Divider() {
   );
 }
 
-export function SnapshotIcon({ events }: { events: types.CameraEvent[] }) {
+export function SnapshotIcon({
+  events,
+  parentGroup,
+}: {
+  events: types.CameraEvent[];
+  parentGroup?: types.CameraEvent[];
+}) {
   const Icon = getIcon(events[0]);
 
   return (
@@ -291,7 +312,7 @@ export function SnapshotIcon({ events }: { events: types.CameraEvent[] }) {
                 horizontal: "left",
               }}
             >
-              <PopoverContent events={events} />
+              <PopoverContent events={events} parentGroup={parentGroup} />
             </Popover>
           </div>
       )}
@@ -315,13 +336,19 @@ function SnapshotIcons({ events }: { events: types.CameraEvent[] }) {
           );
           return Object.keys(uniqueLabels).map((label) => (
             <Box key={`icon-${key}-${label}`}>
-              <SnapshotIcon events={uniqueLabels[label]} />
+              <SnapshotIcon
+                events={uniqueLabels[label]}
+                parentGroup={sortedEvents}
+              />
             </Box>
           ));
         }
         return (
           <Box key={`icon-${key}`}>
-            <SnapshotIcon events={uniqueEvents[key]} />
+            <SnapshotIcon
+              events={uniqueEvents[key]}
+              parentGroup={sortedEvents}
+            />
           </Box>
         );
       })}

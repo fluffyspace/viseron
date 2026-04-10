@@ -2,19 +2,22 @@ import { useQuery } from "@tanstack/react-query";
 
 import { viseronAPI } from "lib/api/client";
 
-export interface MotionMetrics {
-  samples: [number, number][]; // [offset_ms, level_pct]
-  events: [number, number][]; // [start_ms, end_ms]
+export interface TrackedObject {
+  track_id?: number;
+  label: string;
+  confidence: number;
+  box: [number, number, number, number]; // [x1, y1, x2, y2] relative
 }
 
-export interface ObjectMetrics {
-  samples: [number, string, number][]; // [offset_ms, label, confidence]
+export interface EventFrame {
+  t: number; // offset_ms from recording start
+  m?: number; // motion area 0–100
+  o?: TrackedObject[]; // objects detected in this frame
 }
 
 export interface DetectionMetrics {
   version: number;
-  motion: MotionMetrics;
-  objects: ObjectMetrics;
+  frames: EventFrame[];
 }
 
 interface RecordingMetricsResponse {

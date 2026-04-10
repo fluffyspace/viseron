@@ -37,11 +37,16 @@ type EventTableItemIconsProps = {
 
 function EventTableItemIcons({ sortedEvents }: EventTableItemIconsProps) {
   const uniqueEvents = extractUniqueTypes(sortedEvents);
+  // Use the recording in the group as the headline event when present, so the
+  // card's metadata (time, duration, thumbnail) describes the playable clip
+  // rather than an arbitrary detection inside it.
+  const headlineEvent =
+    sortedEvents.find((e) => e.type === "recording") ?? sortedEvents[0];
   const cameraName = getCameraNameFromQueryCache(
-    sortedEvents[0].camera_identifier,
+    headlineEvent.camera_identifier,
   );
-  const durationSeconds = getEventDurationSeconds(sortedEvents[0]);
-  const timeStr = getTimeFromDate(new Date(getEventTime(sortedEvents[0])));
+  const durationSeconds = getEventDurationSeconds(headlineEvent);
+  const timeStr = getTimeFromDate(new Date(getEventTime(headlineEvent)));
 
   return (
     <div>
@@ -61,13 +66,19 @@ function EventTableItemIcons({ sortedEvents }: EventTableItemIconsProps) {
             );
             return Object.keys(uniqueLabels).map((label) => (
               <Grid key={`icon-${key}-${label}`}>
-                <SnapshotIcon events={uniqueLabels[label]} />
+                <SnapshotIcon
+                  events={uniqueLabels[label]}
+                  parentGroup={sortedEvents}
+                />
               </Grid>
             ));
           }
           return (
             <Grid key={`icon-${key}`}>
-              <SnapshotIcon events={uniqueEvents[key]} />
+              <SnapshotIcon
+                events={uniqueEvents[key]}
+                parentGroup={sortedEvents}
+              />
             </Grid>
           );
         })}
@@ -106,13 +117,19 @@ export const EventTableItem = memo(
     );
     const handleEventClick = useSelectEvent();
 
+    // Headline event = the recording in the group if present, otherwise the
+    // chronologically first event. The card thumbnail and the "is selected"
+    // highlight both follow the headline so the row visually represents the
+    // same thing the click selects.
+    const headlineEvent =
+      sortedEvents.find((e) => e.type === "recording") ?? sortedEvents[0];
+
     const src = useMemo(
-      () =>
-        isScrolling && firstRender ? BLANK_IMAGE : getSrc(sortedEvents[0]),
-      [isScrolling, firstRender, sortedEvents],
+      () => (isScrolling && firstRender ? BLANK_IMAGE : getSrc(headlineEvent)),
+      [isScrolling, firstRender, headlineEvent],
     );
 
-    const selected = !!selectedEvent && selectedEvent.id === sortedEvents[0].id;
+    const selected = !!selectedEvent && selectedEvent.id === headlineEvent.id;
 
     return (
       <Card
@@ -142,7 +159,7 @@ export const EventTableItem = memo(
               },
         ]}
       >
-        <CardActionArea onClick={() => handleEventClick(sortedEvents[0])}>
+        <CardActionArea onClick={() => handleEventClick(headlineEvent)}>
           <Grid
             container
             direction="row"

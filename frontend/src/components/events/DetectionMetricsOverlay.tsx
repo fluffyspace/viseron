@@ -52,13 +52,20 @@ export function DetectionMetricsOverlay({
   const animFrameRef = useRef<number>(0);
   const sizeRef = useRef({ width: 0, height: 0 });
 
+  const { frames } = metrics;
+
+  // Collect unique object labels for the legend
   const objectLabels = useMemo(() => {
     const labels = new Set<string>();
-    for (const sample of metrics.objects.samples) {
-      labels.add(sample[1]);
+    for (const frame of frames) {
+      if (frame.o) {
+        for (const obj of frame.o) {
+          labels.add(obj.label);
+        }
+      }
     }
     return Array.from(labels);
-  }, [metrics.objects.samples]);
+  }, [frames]);
 
   // Draw static elements to offscreen canvas
   const drawStatic = useCallback(
@@ -74,36 +81,30 @@ export function DetectionMetricsOverlay({
       const logicalH = height / dpr;
       ctx.scale(dpr, dpr);
 
-      // Motion event regions
-      ctx.fillStyle = "rgba(255, 152, 0, 0.15)";
-      for (const [startMs, endMs] of metrics.motion.events) {
-        const x1 = (startMs / durationMs) * logicalW;
-        const x2 = (endMs / durationMs) * logicalW;
-        ctx.fillRect(x1, 0, x2 - x1, logicalH);
-      }
-
-      // Motion waveform
-      const motionSamples = metrics.motion.samples;
-      if (motionSamples.length > 1) {
+      // Motion waveform from per-frame motion_area
+      const motionFrames = frames.filter((f) => f.m !== undefined);
+      if (motionFrames.length > 1) {
+        // Filled area
         ctx.beginPath();
         ctx.moveTo(0, logicalH);
-        for (const [offsetMs, levelPct] of motionSamples) {
-          const x = (offsetMs / durationMs) * logicalW;
-          const y = logicalH - (levelPct / 100) * (logicalH * 0.8);
+        for (const f of motionFrames) {
+          const x = (f.t / durationMs) * logicalW;
+          const y = logicalH - ((f.m ?? 0) / 100) * (logicalH * 0.8);
           ctx.lineTo(x, y);
         }
         const lastX =
-          (motionSamples[motionSamples.length - 1][0] / durationMs) * logicalW;
+          (motionFrames[motionFrames.length - 1].t / durationMs) * logicalW;
         ctx.lineTo(lastX, logicalH);
         ctx.closePath();
         ctx.fillStyle = "rgba(76, 175, 80, 0.45)";
         ctx.fill();
 
+        // Stroke line
         ctx.beginPath();
-        for (let i = 0; i < motionSamples.length; i++) {
-          const [offsetMs, levelPct] = motionSamples[i];
-          const x = (offsetMs / durationMs) * logicalW;
-          const y = logicalH - (levelPct / 100) * (logicalH * 0.8);
+        for (let i = 0; i < motionFrames.length; i++) {
+          const x = (motionFrames[i].t / durationMs) * logicalW;
+          const y =
+            logicalH - ((motionFrames[i].m ?? 0) / 100) * (logicalH * 0.8);
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         }
@@ -112,20 +113,26 @@ export function DetectionMetricsOverlay({
         ctx.stroke();
       }
 
-      // Object markers
+      // Object markers — one dot per object per frame
       const markerY = 8;
       const markerRadius = 3;
-      for (const [offsetMs, label] of metrics.objects.samples) {
-        const x = (offsetMs / durationMs) * logicalW;
-        ctx.beginPath();
-        ctx.arc(x, markerY, markerRadius, 0, Math.PI * 2);
-        ctx.fillStyle = getLabelColor(label as string);
-        ctx.fill();
+      for (const frame of frames) {
+        if (!frame.o) continue;
+        const x = (frame.t / durationMs) * logicalW;
+        // Stack multiple objects vertically so dots don't overlap
+        for (let oi = 0; oi < frame.o.length; oi++) {
+          const obj = frame.o[oi];
+          const y = markerY + oi * (markerRadius * 2 + 1);
+          ctx.beginPath();
+          ctx.arc(x, y, markerRadius, 0, Math.PI * 2);
+          ctx.fillStyle = getLabelColor(obj.label);
+          ctx.fill();
+        }
       }
 
       return offscreen;
     },
-    [metrics, durationMs],
+    [frames, durationMs],
   );
 
   // Handle resize
@@ -152,7 +159,9 @@ export function DetectionMetricsOverlay({
       }
     });
     observer.observe(container);
-    return () => { observer.disconnect(); };
+    return () => {
+      observer.disconnect();
+    };
   }, [drawStatic]);
 
   // Animation loop — reads playingDateRef directly, no re-renders needed
@@ -209,7 +218,10 @@ export function DetectionMetricsOverlay({
       animFrameRef.current = requestAnimationFrame(loop);
     };
     animFrameRef.current = requestAnimationFrame(loop);
-    return () => { running = false; cancelAnimationFrame(animFrameRef.current); };
+    return () => {
+      running = false;
+      cancelAnimationFrame(animFrameRef.current);
+    };
   }, [durationMs, startTimestamp, playingDateRef, theme.palette.mode]);
 
   const handleClick = useCallback(
