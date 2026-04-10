@@ -117,16 +117,17 @@ export function DetectionMetricsOverlay({
       const markerY = 8;
       const markerRadius = 3;
       for (const frame of frames) {
-        if (!frame.o) continue;
-        const x = (frame.t / durationMs) * logicalW;
-        // Stack multiple objects vertically so dots don't overlap
-        for (let oi = 0; oi < frame.o.length; oi++) {
-          const obj = frame.o[oi];
-          const y = markerY + oi * (markerRadius * 2 + 1);
-          ctx.beginPath();
-          ctx.arc(x, y, markerRadius, 0, Math.PI * 2);
-          ctx.fillStyle = getLabelColor(obj.label);
-          ctx.fill();
+        if (frame.o) {
+          const x = (frame.t / durationMs) * logicalW;
+          // Stack multiple objects vertically so dots don't overlap
+          for (let oi = 0; oi < frame.o.length; oi++) {
+            const obj = frame.o[oi];
+            const y = markerY + oi * (markerRadius * 2 + 1);
+            ctx.beginPath();
+            ctx.arc(x, y, markerRadius, 0, Math.PI * 2);
+            ctx.fillStyle = getLabelColor(obj.label);
+            ctx.fill();
+          }
         }
       }
 
