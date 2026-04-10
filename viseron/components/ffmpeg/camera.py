@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import multiprocessing as mp
 import os
 import signal
+import threading
 import time
 from queue import Empty, Full
 from typing import TYPE_CHECKING, Any
@@ -408,6 +410,15 @@ class Camera(AbstractCamera):
         self._poll_timer = utcnow().timestamp()
         self._frame_reader = None
         self._frame_relay = None
+        # RLock so that swap_playback_source / stop helpers can re-enter
+        # without deadlocking. Used by both the REST API and the EOF watcher
+        # thread to serialize play / stop / natural-EOF transitions on
+        # playback cameras. Always initialized so callers don't have to
+        # branch on camera type, but only meaningfully held for playback.
+        self._playback_lock = threading.RLock()
+        self._playback_eof_watcher: threading.Thread | None = None
+        self._playback_current_file: str | None = None
+        self._playback_started_at: float | None = None
         # Stream must be initialized before super().__init__ is called as it raises
         # FFprobeError/FFprobeTimeout which is caught in setup() and re-raised as
         # DomainNotReady
@@ -439,6 +450,11 @@ class Camera(AbstractCamera):
         if self._frame_queue:
             self._frame_queue.close()
         self._frame_queue = mp.Queue(maxsize=2)
+        # Playback cameras must not auto-restart on poll-timeout: a finite
+        # mp4 ends naturally and we want the camera to transition to
+        # disconnected, not to loop the file. The EOF watcher (started in
+        # _start_camera) is responsible for the explicit stop.
+        relay_restart = None if self.is_playback_camera else self.start_camera
         # Start watchdogs for this process since it spawns a RestartablePopen
         return RestartableProcess(
             name="viseron.camera." + self.identifier,
@@ -454,7 +470,7 @@ class Camera(AbstractCamera):
             poll_target=self.poll_target,
             daemon=True,
             register=True,
-            restart_method=self.start_camera,
+            restart_method=relay_restart,
         )
 
     def _start_recording_only(self) -> None:
@@ -520,6 +536,17 @@ class Camera(AbstractCamera):
                 return
 
             if self.stream.poll() is not None:
+                if self._config.get(CONFIG_PLAYBACK_MODE):
+                    # Playback cameras consume a finite file. ffmpeg exiting
+                    # is the natural end-of-stream, NOT a decode error: do
+                    # not restart the pipe (that would loop the file).
+                    # Clear capture_frames so the parent's relay thread
+                    # exits, and break out of the read loop. The EOF
+                    # watcher in the parent will then call stop_camera to
+                    # finalize cleanup (stop active recording, etc).
+                    self._logger.info("Playback file finished, signalling stop")
+                    self._capture_frames.clear()
+                    break
                 self._logger.error("Frame reader process has exited")
                 self.decode_error.set()
                 continue
@@ -622,6 +649,118 @@ class Camera(AbstractCamera):
             self._frame_reader, self._frame_relay = self._create_frame_reader()
             self._frame_reader.start()
             self._frame_relay.start()
+            if self.is_playback_camera:
+                self._start_playback_eof_watcher()
+
+    def _start_playback_eof_watcher(self) -> None:
+        """Start a thread that calls stop_camera when ffmpeg exits naturally.
+
+        For playback cameras the input file is finite, so ffmpeg eventually
+        exits on EOF. The subprocess clears ``_capture_frames`` so the read
+        loop and the relay thread both exit, but nothing in the parent calls
+        ``stop_camera`` to finalize state (active recording, ``stopped``
+        event, MQTT updates). This watcher polls the frame reader and, once
+        it dies, schedules ``stop_camera`` from a separate helper thread so
+        the join inside ``stop_camera`` does not deadlock.
+
+        Each watcher is bound to the specific frame_reader instance that
+        existed when it was started. If a subsequent play replaces the
+        frame_reader, the stale watcher detects the swap (its captured
+        ``frame_reader`` no longer matches ``self._frame_reader``) and
+        exits without touching the new playback.
+        """
+        # Capture the frame_reader by identity so we don't act on a stale
+        # one if the user starts another playback before this watcher
+        # gets to acquire the lock.
+        frame_reader = self._frame_reader
+
+        def watch() -> None:
+            while frame_reader is not None and frame_reader.is_alive():
+                time.sleep(0.5)
+            if not self.is_playback_camera:
+                return
+            with self._playback_lock:
+                # If a newer play has already replaced our frame_reader,
+                # we're a stale watcher from the previous session. Bail
+                # out without touching the new playback.
+                if self._frame_reader is not frame_reader:
+                    return
+                # Another thread (explicit stop) may have already called
+                # stop_camera in the meantime; that is fine, stop_camera
+                # is idempotent against an already-stopped state.
+                if self.stopped.is_set():
+                    return
+                self._logger.debug(
+                    "Playback EOF watcher: frame reader exited, stopping camera"
+                )
+                # stop_camera joins the relay thread and the frame reader.
+                # We are NOT one of those threads (we are the watcher), so
+                # there is no self-join deadlock.
+                self.stop_camera()
+
+        watcher = threading.Thread(
+            target=watch,
+            name=f"viseron.camera.{self.identifier}.playback_eof_watcher",
+            daemon=True,
+        )
+        self._playback_eof_watcher = watcher
+        watcher.start()
+
+    def swap_playback_source(self, file_path: str) -> None:
+        """Swap the file_source on a playback camera and restart it.
+
+        ``Stream.__init__`` runs ffprobe and caches width/height/fps/codec
+        in ``self.stream``; ``frame_bytes_size`` is derived from that. So
+        we cannot just mutate ``_config[CONFIG_FILE_SOURCE]`` and call
+        ``start_camera`` - the relay would silently drop frames whose
+        size does not match the cached value. Instead, fully rebuild
+        Stream and Recorder against the new file under the per-camera
+        playback lock.
+
+        Caller is expected to be the playback REST API, which has already
+        validated the path. This method does not validate file existence.
+        """
+        if not self.is_playback_camera:
+            raise RuntimeError(
+                f"swap_playback_source called on non-playback camera "
+                f"{self.identifier!r}"
+            )
+
+        with self._playback_lock:
+            # Stop current playback if any. stop_camera is a no-op if the
+            # camera is already stopped.
+            if not self.stopped.is_set():
+                self._logger.debug("Stopping current playback before swap")
+                self.stop_camera()
+                # stop_camera sets the stopped event synchronously.
+
+            # Build a fresh config with the new file_source. Deep copy so
+            # we don't mutate any object that may still be referenced by
+            # the previous Stream/Recorder.
+            new_config = copy.deepcopy(self._config)
+            new_config[CONFIG_FILE_SOURCE] = file_path
+
+            # Rebuild Stream against the new file. This re-runs ffprobe
+            # so width/height/fps/codec/audio_codec are correct for the
+            # new file. attempt=1 because we don't track retries here.
+            self._logger.debug(f"Rebuilding Stream for playback file {file_path}")
+            self.stream = Stream(new_config, self, self.identifier, 1)
+
+            # Update derived values that hang off the Stream.
+            self._config = new_config
+            self.resolution = (self.stream.width, self.stream.height)
+
+            # Recorder caches storage paths from config; rebuild it so any
+            # change in resolution / codec is reflected. Folders are
+            # identifier-keyed so the playback camera writes to its own
+            # subdirectory automatically.
+            self._recorder = Recorder(self._vis, new_config, self)
+
+            self._playback_current_file = file_path
+            self._playback_started_at = utcnow().timestamp()
+
+            self._logger.info(f"Starting playback of {file_path}")
+            self.start_camera()
 
     def _stop_camera(self) -> None:
         """Release the connection to the camera."""
