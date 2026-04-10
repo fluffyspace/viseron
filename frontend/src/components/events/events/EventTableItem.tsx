@@ -31,6 +31,17 @@ const getEventDurationSeconds = (event: types.CameraEvent): number | null => {
   return null;
 };
 
+// Each event type lives in its own DB table with its own auto-increment id,
+// so the numeric ids overlap across types. The single-letter prefix makes the
+// origin table unambiguous when reporting an event.
+const EVENT_TYPE_PREFIX: Record<types.CameraEvent["type"], string> = {
+  recording: "R",
+  motion: "M",
+  object: "O",
+  face_recognition: "F",
+  license_plate_recognition: "L",
+};
+
 type EventTableItemIconsProps = {
   sortedEvents: types.CameraEvent[];
 };
@@ -63,7 +74,8 @@ function EventTableItemIcons({ sortedEvents }: EventTableItemIconsProps) {
         align="center"
         sx={{ fontFamily: "monospace" }}
       >
-        #{headlineEvent.id}
+        #{EVENT_TYPE_PREFIX[headlineEvent.type]}
+        {headlineEvent.id}
       </Typography>
       <Grid container justifyContent="center" alignItems="center">
         {Object.keys(uniqueEvents).map((key) => {
