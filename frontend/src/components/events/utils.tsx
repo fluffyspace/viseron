@@ -113,33 +113,40 @@ export const useFilterStore = create<FilterState>()(
       setFilters: (filters) => set({ filters }),
       toggleFilter: (filterKey) => {
         set((state) => {
-          const newFilters = { ...state.filters };
-
           switch (filterKey) {
             case "groupCameras":
             case "lookbackAdjust":
-              newFilters[filterKey] = {
-                ...newFilters[filterKey],
-                checked: !newFilters[filterKey].checked,
+              return {
+                filters: {
+                  ...state.filters,
+                  [filterKey]: {
+                    ...state.filters[filterKey],
+                    checked: !state.filters[filterKey].checked,
+                  },
+                },
               };
-              break;
             case "motion":
             case "object":
             case "recording":
             case "face_recognition":
             case "license_plate_recognition":
-              newFilters.eventTypes[filterKey] = {
-                ...newFilters.eventTypes[filterKey],
-                checked: !newFilters.eventTypes[filterKey].checked,
+              return {
+                filters: {
+                  ...state.filters,
+                  eventTypes: {
+                    ...state.filters.eventTypes,
+                    [filterKey]: {
+                      ...state.filters.eventTypes[filterKey],
+                      checked: !state.filters.eventTypes[filterKey].checked,
+                    },
+                  },
+                },
               };
-              break;
-            default:
-              // eslint-disable-next-line no-case-declarations
+            default: {
               const _exhaustiveCheck: never = filterKey;
               throw new Error(`Unhandled filter key: ${_exhaustiveCheck}`);
+            }
           }
-
-          return { filters: newFilters };
         });
       },
       toggleObjectLabel: (normalizedLabel) => {

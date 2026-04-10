@@ -7,6 +7,7 @@ import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
 import { NestedMenuItem } from "mui-nested-menu";
 import React, { MouseEvent, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 
 import {
   FilterKeysFromFilters,
@@ -40,7 +41,13 @@ const menuProps: MenuProps = {
 export function FilterMenu() {
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const open = Boolean(anchorEl);
-  const { filters, toggleFilter, toggleObjectLabel } = useFilterStore();
+  const { filters, toggleFilter, toggleObjectLabel } = useFilterStore(
+    useShallow((state) => ({
+      filters: state.filters,
+      toggleFilter: state.toggleFilter,
+      toggleObjectLabel: state.toggleObjectLabel,
+    })),
+  );
 
   const handleClick = (event: MouseEvent<HTMLElement>) => {
     setAnchorEl(event.currentTarget);
@@ -50,6 +57,9 @@ export function FilterMenu() {
     setAnchorEl(null);
   };
 
+  // The MenuItem owns the click; preventDefault stops the menu from closing
+  // and stopPropagation prevents the click bubbling to a parent NestedMenuItem
+  // (which would otherwise also fire its onClick and double-toggle).
   const handleCheckboxClick =
     (filterKey: FilterKeysFromFilters) => (event: MouseEvent<HTMLElement>) => {
       event.stopPropagation();
@@ -107,7 +117,8 @@ export function FilterMenu() {
                     <>
                       <Checkbox
                         checked={filters.eventTypes.object.checked}
-                        onClick={handleCheckboxClick(key)}
+                        tabIndex={-1}
+                        disableRipple
                       />
                       <ListItemIcon>
                         <Icon />
@@ -130,7 +141,8 @@ export function FilterMenu() {
                       >
                         <Checkbox
                           checked={labelFilter.checked}
-                          onClick={handleObjectLabelClick(labelKey)}
+                          tabIndex={-1}
+                          disableRipple
                         />
                         <ListItemText primary={labelFilter.label} />
                       </MenuItem>
@@ -147,7 +159,8 @@ export function FilterMenu() {
               >
                 <Checkbox
                   checked={filters.eventTypes[key].checked}
-                  onClick={handleCheckboxClick(key)}
+                  tabIndex={-1}
+                  disableRipple
                 />
                 <ListItemIcon>
                   <Icon />
@@ -163,7 +176,8 @@ export function FilterMenu() {
         >
           <Checkbox
             checked={filters.groupCameras.checked}
-            onClick={handleCheckboxClick("groupCameras")}
+            tabIndex={-1}
+            disableRipple
           />
           <ListItemText primary={filters.groupCameras.label} />
         </MenuItem>
@@ -173,7 +187,8 @@ export function FilterMenu() {
         >
           <Checkbox
             checked={filters.lookbackAdjust.checked}
-            onClick={handleCheckboxClick("lookbackAdjust")}
+            tabIndex={-1}
+            disableRipple
           />
           <ListItemText primary={filters.lookbackAdjust.label} />
         </MenuItem>
