@@ -83,6 +83,7 @@ export const handlers = [
         connected: true,
         is_recording: false,
         continuous_recording: false,
+        is_playback_camera: false,
       },
       camera2: {
         identifier: "camera2",
@@ -106,6 +107,7 @@ export const handlers = [
         connected: true,
         is_recording: true,
         continuous_recording: false,
+        is_playback_camera: false,
       },
       camera3: {
         identifier: "camera3",
@@ -129,6 +131,7 @@ export const handlers = [
         connected: true,
         is_recording: false,
         continuous_recording: false,
+        is_playback_camera: false,
       },
     };
     return HttpResponse.json(cameras, { status: 200 });
@@ -160,6 +163,7 @@ export const handlers = [
       connected: true,
       is_recording: false,
       continuous_recording: false,
+      is_playback_camera: false,
     };
     return HttpResponse.json(camera, { status: 200 });
   }),
@@ -186,6 +190,7 @@ export const handlers = [
       connected: true,
       is_recording: true,
       continuous_recording: false,
+      is_playback_camera: false,
     };
     return HttpResponse.json(camera, { status: 200 });
   }),
@@ -212,6 +217,7 @@ export const handlers = [
       connected: true,
       is_recording: false,
       continuous_recording: false,
+      is_playback_camera: false,
     };
     return HttpResponse.json(camera, { status: 200 });
   }),

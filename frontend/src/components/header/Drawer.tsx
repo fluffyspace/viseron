@@ -4,6 +4,7 @@ import {
   IntrusionPrevention,
   LogoGithub,
   Need,
+  PlayFilledAlt,
   Roadmap,
   Settings,
   TableSplit,
@@ -81,6 +82,7 @@ const getDrawerItems = (
     },
     { type: "link", title: "Entities", icon: TableSplit, path: "/entities" },
     { type: "link", title: "Tests", icon: Tools, path: "/tests" },
+    { type: "link", title: "Playback", icon: PlayFilledAlt, path: "/playback" },
     ...(!auth.enabled || (auth.enabled && user?.role === "admin")
       ? [
           { type: "divider" } as DrawerItemTypes,

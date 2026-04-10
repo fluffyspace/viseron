@@ -192,6 +192,28 @@ export interface Camera {
   live_stream_available: boolean;
   is_recording: boolean;
   continuous_recording: boolean;
+  is_playback_camera: boolean;
+}
+
+export interface PlaybackState {
+  camera_identifier: string;
+  is_playing: boolean;
+  is_on: boolean;
+  current_file: string | null;
+  started_at: string | null;
+}
+
+export interface PlaybackPlayResponse {
+  status: "playing";
+  camera_identifier: string;
+  recording_id: number;
+  file: string;
+  started_at: string;
+}
+
+export interface PlaybackStopResponse {
+  status: "stopped";
+  camera_identifier: string;
 }
 
 export interface Cameras {

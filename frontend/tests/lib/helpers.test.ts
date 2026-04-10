@@ -40,6 +40,7 @@ const mockCamera: types.Camera = {
   live_stream_available: true,
   is_recording: false,
   continuous_recording: false,
+  is_playback_camera: false,
 };
 
 describe("sortObj", () => {

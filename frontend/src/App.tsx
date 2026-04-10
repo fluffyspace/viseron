@@ -17,6 +17,7 @@ const Login = lazy(() => import("pages/Login"));
 const Live = lazy(() => import("pages/Live"));
 const NotFound = lazy(() => import("pages/NotFound"));
 const Onboarding = lazy(() => import("pages/Onboarding"));
+const Playback = lazy(() => import("pages/Playback"));
 const Profile = lazy(() => import("pages/Profile"));
 const PublicLayout = lazy(() => import("layouts/PublicLayout"));
 const Recordings = lazy(() => import("pages/recordings/Recordings"));
@@ -81,6 +82,10 @@ function App() {
         {
           path: "/tests",
           element: <Tests />,
+        },
+        {
+          path: "/playback",
+          element: <Playback />,
         },
         {
           path: "/profile",
