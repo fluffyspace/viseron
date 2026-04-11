@@ -1,4 +1,9 @@
-import { PlayFilledAlt, StopFilledAlt } from "@carbon/icons-react";
+import {
+  PlayFilledAlt,
+  StarFilled,
+  Star,
+  StopFilledAlt,
+} from "@carbon/icons-react";
 import Alert from "@mui/material/Alert";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -8,14 +13,20 @@ import Chip from "@mui/material/Chip";
 import Container from "@mui/material/Container";
 import Divider from "@mui/material/Divider";
 import FormControl from "@mui/material/FormControl";
+import IconButton from "@mui/material/IconButton";
 import InputLabel from "@mui/material/InputLabel";
 import LinearProgress from "@mui/material/LinearProgress";
 import MenuItem from "@mui/material/MenuItem";
 import Paper from "@mui/material/Paper";
 import Select, { SelectChangeEvent } from "@mui/material/Select";
 import Stack from "@mui/material/Stack";
+import Tab from "@mui/material/Tab";
+import Tabs from "@mui/material/Tabs";
+import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import { useTheme } from "@mui/material/styles";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
+import { Dayjs } from "dayjs";
 import { useContext, useEffect, useMemo, useState } from "react";
 
 import { Loading } from "components/loading/Loading";
@@ -37,6 +48,7 @@ import {
   objHasValues,
 } from "lib/helpers";
 import { getDateStringFromDayjs, getDayjs } from "lib/helpers/dates";
+import { usePlaybackFavorites } from "lib/playbackFavorites";
 import * as types from "lib/types";
 
 const MAX_LOG_ENTRIES = 200;
@@ -147,24 +159,33 @@ function RecordingPickerRow({
   event,
   cameraName,
   busy,
+  isFavorite,
   onPlay,
+  onToggleFavorite,
 }: {
   event: types.CameraRecordingEvent;
   cameraName: string;
   busy: boolean;
+  isFavorite: boolean;
   onPlay: (event: types.CameraRecordingEvent) => void;
+  onToggleFavorite: (event: types.CameraRecordingEvent) => void;
 }) {
   const theme = useTheme();
   const startTime = getTimeFromDate(new Date(event.start_time));
   const dateStr = event.start_time.slice(0, 10);
   const duration = event.duration ? formatDuration(event.duration) : "—";
 
+  // The star button intentionally lives outside the CardActionArea so MUI's
+  // ripple/click handler on the row doesn't fire when toggling favorites.
   return (
-    <Card variant="outlined" sx={{ mb: 0.5 }}>
+    <Card
+      variant="outlined"
+      sx={{ mb: 0.5, display: "flex", alignItems: "stretch" }}
+    >
       <CardActionArea
         disabled={busy}
         onClick={() => onPlay(event)}
-        sx={{ display: "flex", alignItems: "stretch" }}
+        sx={{ display: "flex", alignItems: "stretch", flex: 1 }}
       >
         <Box
           sx={{
@@ -230,6 +251,33 @@ function RecordingPickerRow({
           <PlayFilledAlt size={20} />
         </Box>
       </CardActionArea>
+      <Box
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          borderLeft: `1px solid ${theme.palette.divider}`,
+          px: 0.25,
+        }}
+      >
+        <Tooltip
+          title={isFavorite ? "Remove from favorites" : "Add to favorites"}
+        >
+          <IconButton
+            size="small"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleFavorite(event);
+            }}
+            sx={{
+              color: isFavorite
+                ? theme.palette.warning.main
+                : theme.palette.text.disabled,
+            }}
+          >
+            {isFavorite ? <StarFilled size={18} /> : <Star size={18} />}
+          </IconButton>
+        </Tooltip>
+      </Box>
     </Card>
   );
 }
@@ -479,16 +527,25 @@ function Playback() {
   const playbackState = usePlaybackState(targetId || null);
   const playMutation = usePlayRecording();
   const stopMutation = useStopPlayback();
+  const { favorites, isFavorite, toggle: toggleFavorite } =
+    usePlaybackFavorites();
 
-  // Today's events for the source cameras, filtered to recordings.
-  const todayStr = useMemo(() => getDateStringFromDayjs(getDayjs()), []);
+  // Tab state — "recent" browses by date, "favorites" shows the persisted
+  // localStorage list regardless of date.
+  const [tab, setTab] = useState<"recent" | "favorites">("recent");
+
+  // Date state for the "recent" tab. Defaulted to today; the user can pick
+  // any date with the inline DatePicker in the panel header.
+  const [date, setDate] = useState<Dayjs>(() => getDayjs());
+  const dateStr = useMemo(() => getDateStringFromDayjs(date), [date]);
+
   const sourceIds = useMemo(
     () => sourceCameras.map((c) => c.identifier),
     [sourceCameras],
   );
   const eventQueries = useEventsMultiple({
     camera_identifiers: sourceIds,
-    date: todayStr,
+    date: dateStr,
   });
 
   const recordings = useMemo<types.CameraRecordingEvent[]>(() => {
@@ -499,6 +556,16 @@ function Playback() {
       (e): e is types.CameraRecordingEvent => e.type === "recording",
     );
   }, [eventQueries]);
+
+  // Favorites are stored as a flat map; render them sorted newest-first to
+  // match the recent tab's ordering.
+  const favoriteList = useMemo<types.CameraRecordingEvent[]>(
+    () =>
+      Object.values(favorites).sort(
+        (a, b) => b.created_at_timestamp - a.created_at_timestamp,
+      ),
+    [favorites],
+  );
 
   const cameraNameById = useMemo(() => {
     const map: Record<string, string> = {};
@@ -560,7 +627,8 @@ function Playback() {
             minHeight: 0,
           }}
         >
-          {/* Left: recordings picker */}
+          {/* Left: recordings picker — tabs switch between date-browsable
+              recent recordings and the persisted favorites list. */}
           <Paper
             variant="outlined"
             sx={{
@@ -570,46 +638,121 @@ function Playback() {
               overflow: "hidden",
             }}
           >
-            <Box
-              sx={{
-                px: 1.5,
-                py: 0.75,
-                borderBottom: `1px solid ${theme.palette.divider}`,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-              }}
+            <Tabs
+              value={tab}
+              onChange={(_, v: "recent" | "favorites") => setTab(v)}
+              variant="fullWidth"
+              sx={{ borderBottom: `1px solid ${theme.palette.divider}` }}
             >
-              <Typography variant="subtitle2">
-                Today&apos;s recordings
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                {recordings.length}
-              </Typography>
-            </Box>
-            {(eventQueries as unknown as { isPending: boolean }).isPending && (
-              <LinearProgress />
+              <Tab value="recent" label="Recent" />
+              <Tab
+                value="favorites"
+                label={`Favorites${
+                  favoriteList.length ? ` (${favoriteList.length})` : ""
+                }`}
+              />
+            </Tabs>
+
+            {tab === "recent" && (
+              <Box
+                sx={{
+                  px: 1.5,
+                  py: 1,
+                  borderBottom: `1px solid ${theme.palette.divider}`,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 1,
+                }}
+              >
+                <DatePicker
+                  label="Date"
+                  value={date}
+                  onChange={(value) => {
+                    if (value) setDate(value);
+                  }}
+                  format="YYYY-MM-DD"
+                  slotProps={{
+                    textField: { size: "small", sx: { maxWidth: 180 } },
+                  }}
+                />
+                <Stack
+                  direction="row"
+                  spacing={0.5}
+                  alignItems="center"
+                  sx={{ flexShrink: 0 }}
+                >
+                  <Button
+                    size="small"
+                    variant="text"
+                    onClick={() => setDate(getDayjs())}
+                  >
+                    Today
+                  </Button>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ minWidth: 24, textAlign: "right" }}
+                  >
+                    {recordings.length}
+                  </Typography>
+                </Stack>
+              </Box>
             )}
+
+            {tab === "recent" &&
+              (eventQueries as unknown as { isPending: boolean }).isPending && (
+                <LinearProgress />
+              )}
+
             <Box sx={{ flex: 1, overflowY: "auto", p: 1 }}>
-              {recordings.length === 0 ? (
+              {tab === "recent" ? (
+                recordings.length === 0 ? (
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ fontStyle: "italic", textAlign: "center", mt: 2 }}
+                  >
+                    No recordings on {dateStr}.
+                  </Typography>
+                ) : (
+                  recordings.map((event) => (
+                    <RecordingPickerRow
+                      key={`R${event.id}`}
+                      event={event}
+                      cameraName={
+                        cameraNameById[event.camera_identifier] ??
+                        event.camera_identifier
+                      }
+                      busy={busy}
+                      isFavorite={isFavorite(event)}
+                      onPlay={handlePlay}
+                      onToggleFavorite={toggleFavorite}
+                    />
+                  ))
+                )
+              ) : favoriteList.length === 0 ? (
                 <Typography
                   variant="body2"
                   color="text.secondary"
                   sx={{ fontStyle: "italic", textAlign: "center", mt: 2 }}
                 >
-                  No recordings from today.
+                  No favorites yet. Star a recording on the Recent tab to save
+                  it here.
                 </Typography>
               ) : (
-                recordings.map((event) => (
+                favoriteList.map((event) => (
                   <RecordingPickerRow
-                    key={`R${event.id}`}
+                    key={`fav-R${event.camera_identifier}-${event.id}`}
                     event={event}
                     cameraName={
                       cameraNameById[event.camera_identifier] ??
                       event.camera_identifier
                     }
                     busy={busy}
+                    isFavorite
                     onPlay={handlePlay}
+                    onToggleFavorite={toggleFavorite}
                   />
                 ))
               )}
