@@ -7,15 +7,29 @@ identically to a live feed. Used for end-to-end debugging without having
 to physically generate live footage.
 
 Endpoints:
-- POST /api/v1/playback/{camera_identifier}/play  body {"recording_id": int}
-- POST /api/v1/playback/{camera_identifier}/stop
-- GET  /api/v1/playback/{camera_identifier}
+- POST   /api/v1/playback/favorites               body {"recording_id": int}
+- GET    /api/v1/playback/favorites
+- DELETE /api/v1/playback/favorites/{src}/{id}
+- POST   /api/v1/playback/{camera_identifier}/play  body {"recording_id": int,
+                                                          "source_camera_identifier": str?}
+- POST   /api/v1/playback/{camera_identifier}/stop
+- GET    /api/v1/playback/{camera_identifier}
+
+Favorites are persisted under ``/favorites/<source_camera>/R<id>.mp4`` plus a
+sidecar ``R<id>.json`` carrying the original event metadata + a base64
+thumbnail. The directory is mounted from the host outside any storage tier
+path so the tier sweeper never touches it — favorites stay playable
+indefinitely even after the original recording is purged from tier 3.
 """
 from __future__ import annotations
 
+import base64
 import datetime
+import json
 import logging
 import os
+import re
+import shutil
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
@@ -33,11 +47,58 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+FAVORITES_DIR = "/favorites"
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _favorite_dir(source_camera: str) -> str:
+    if not _SAFE_NAME_RE.match(source_camera):
+        raise ValueError(f"Invalid camera identifier: {source_camera!r}")
+    return os.path.join(FAVORITES_DIR, source_camera)
+
+
+def _favorite_video_path(source_camera: str, recording_id: int) -> str:
+    return os.path.join(_favorite_dir(source_camera), f"R{recording_id}.mp4")
+
+
+def _favorite_sidecar_path(source_camera: str, recording_id: int) -> str:
+    return os.path.join(_favorite_dir(source_camera), f"R{recording_id}.json")
+
 
 class PlaybackAPIHandler(BaseAPIHandler):
     """Handler for interactive playback of saved recordings."""
 
     routes = [
+        # Favorites routes must precede the catch-all camera routes so the
+        # word "favorites" is not interpreted as a camera identifier.
+        {
+            "requires_role": [Role.ADMIN, Role.WRITE],
+            "path_pattern": r"/playback/favorites",
+            "supported_methods": ["POST"],
+            "method": "post_favorite",
+            "json_body_schema": vol.Schema(
+                {
+                    vol.Required("recording_id"): vol.All(
+                        vol.Coerce(int), vol.Range(min=1)
+                    ),
+                }
+            ),
+        },
+        {
+            "requires_role": [Role.ADMIN, Role.READ, Role.WRITE],
+            "path_pattern": r"/playback/favorites",
+            "supported_methods": ["GET"],
+            "method": "get_favorites",
+        },
+        {
+            "requires_role": [Role.ADMIN, Role.WRITE],
+            "path_pattern": (
+                r"/playback/favorites/(?P<source_camera>[A-Za-z0-9_]+)/"
+                r"(?P<recording_id>[0-9]+)"
+            ),
+            "supported_methods": ["DELETE"],
+            "method": "delete_favorite",
+        },
         {
             "requires_role": [Role.ADMIN, Role.WRITE],
             "path_pattern": (
@@ -49,6 +110,9 @@ class PlaybackAPIHandler(BaseAPIHandler):
                 {
                     vol.Required("recording_id"): vol.All(
                         vol.Coerce(int), vol.Range(min=1)
+                    ),
+                    vol.Optional("source_camera_identifier"): vol.All(
+                        str, vol.Match(_SAFE_NAME_RE)
                     ),
                 }
             ),
@@ -70,6 +134,10 @@ class PlaybackAPIHandler(BaseAPIHandler):
             "method": "get_status",
         },
     ]
+
+    # ------------------------------------------------------------------ #
+    # camera + recording resolution
+    # ------------------------------------------------------------------ #
 
     def _get_playback_camera(
         self, camera_identifier: str
@@ -98,34 +166,58 @@ class PlaybackAPIHandler(BaseAPIHandler):
         return camera
 
     def _resolve_recording_path(
-        self, recording_id: int, target_camera: AbstractCamera
+        self,
+        recording_id: int,
+        target_camera: AbstractCamera,
+        source_camera_hint: str | None = None,
     ) -> tuple[str | None, str | None]:
         """Look up a recording's playable path.
 
-        Returns ``(file_path, error_message)``. If file_path is set the
-        caller can feed it to ``swap_playback_source``. Otherwise an
-        error response should be sent with the message.
-
-        If the recording has a ``clip_path`` and the file exists, that
-        is used directly. Otherwise the source camera's fragmenter is
-        used to concatenate the recording's segments into a temporary
-        mp4 (matches the existing ``_concatenate_fragments`` flow used
-        on natural recording end).
+        Resolution order:
+        1. If a favorite blob exists at ``/favorites/<src>/R<id>.mp4`` (using
+           either ``source_camera_hint`` or the DB row's camera), use that.
+           This keeps favorites playable after tier purge wipes the DB row.
+        2. The DB row's ``clip_path`` if the file still exists.
+        3. On-the-fly fragment concatenation via the source camera's
+           fragmenter.
         """
+        # 1. Favorite blob (cheap to check, survives DB purge).
+        if source_camera_hint:
+            fav_path = _favorite_video_path(source_camera_hint, recording_id)
+            if os.path.isfile(fav_path):
+                LOGGER.debug(
+                    "Resolved recording %d via favorite blob %s",
+                    recording_id,
+                    fav_path,
+                )
+                return fav_path, None
+
         with self._get_session() as session:
             row = session.execute(
                 select(Recordings).where(Recordings.id == recording_id)
             ).scalar_one_or_none()
             if row is None:
+                # DB row gone — try the favorite as a last resort using
+                # whatever camera dirs we have on disk.
+                fav_blob = _scan_for_favorite(recording_id)
+                if fav_blob:
+                    return fav_blob, None
                 return None, f"Recording {recording_id} not found"
             source_camera_id = row.camera_identifier
             clip_path = row.clip_path
 
-        # If a permanent event clip exists on disk, use it directly.
+        # Recheck favorite using the DB-derived source camera, in case the
+        # caller didn't pass a hint.
+        if not source_camera_hint:
+            fav_path = _favorite_video_path(source_camera_id, recording_id)
+            if os.path.isfile(fav_path):
+                return fav_path, None
+
+        # 2. Permanent event clip on disk.
         if clip_path and os.path.isfile(clip_path):
             return clip_path, None
 
-        # Fall back to on-the-fly concatenation from segments. We need
+        # 3. Fall back to on-the-fly concatenation from segments. We need
         # the SOURCE camera (the one that recorded it), because that is
         # the camera whose fragmenter knows the segments folder layout.
         source_camera = self._get_camera(source_camera_id)
@@ -143,9 +235,6 @@ class PlaybackAPIHandler(BaseAPIHandler):
                 f"fragmenter (unsupported backend)"
             )
 
-        # Recreate the same Fragment list the recorder builds when it
-        # finalizes a recording. Needs the source camera's lookback so
-        # the leading segments are included.
         files = get_recording_fragments(
             recording_id,
             source_camera.recorder.lookback,
@@ -177,6 +266,10 @@ class PlaybackAPIHandler(BaseAPIHandler):
         )
         return clip_temp_path, None
 
+    # ------------------------------------------------------------------ #
+    # play / stop / status
+    # ------------------------------------------------------------------ #
+
     async def post_play(self, camera_identifier: str) -> None:
         """Start (or restart) playback of a recording on this camera."""
         camera = self._get_playback_camera(camera_identifier)
@@ -184,9 +277,13 @@ class PlaybackAPIHandler(BaseAPIHandler):
             return
 
         recording_id = self.json_body["recording_id"]
+        source_camera_hint = self.json_body.get("source_camera_identifier")
 
         file_path, err = await self.run_in_executor(
-            self._resolve_recording_path, recording_id, camera
+            self._resolve_recording_path,
+            recording_id,
+            camera,
+            source_camera_hint,
         )
         if file_path is None:
             self.response_error(HTTPStatus.NOT_FOUND, reason=err or "Not found")
@@ -260,6 +357,271 @@ class PlaybackAPIHandler(BaseAPIHandler):
             }
         )
 
+    # ------------------------------------------------------------------ #
+    # favorites
+    # ------------------------------------------------------------------ #
+
+    async def post_favorite(self) -> None:
+        """Persist a recording as a favorite.
+
+        Copies the resolved video file (and the thumbnail, if present) into
+        ``/favorites/<source_camera>/`` outside any storage tier so it
+        survives tier purges. Writes a sidecar JSON with the original
+        ``CameraRecordingEvent`` so the favorites list is fully self-contained
+        — the frontend can render it without needing the original DB row.
+        """
+        recording_id = self.json_body["recording_id"]
+
+        try:
+            entry, err = await self.run_in_executor(
+                self._create_favorite, recording_id
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.exception("Favorite creation failed for recording %d", recording_id)
+            self.response_error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                reason=f"Failed to create favorite: {exc}",
+            )
+            return
+
+        if entry is None:
+            self.response_error(
+                HTTPStatus.NOT_FOUND, reason=err or "Recording not found"
+            )
+            return
+
+        await self.response_success(response=entry)
+
+    async def get_favorites(self) -> None:
+        """List all persisted favorites by scanning the favorites directory."""
+        entries = await self.run_in_executor(_list_favorites)
+        await self.response_success(response={"favorites": entries})
+
+    async def delete_favorite(
+        self, source_camera: str, recording_id: str
+    ) -> None:
+        """Remove a persisted favorite (video + sidecar)."""
+        try:
+            rec_id = int(recording_id)
+        except ValueError:
+            self.response_error(
+                HTTPStatus.BAD_REQUEST,
+                reason=f"Invalid recording id {recording_id!r}",
+            )
+            return
+
+        try:
+            removed = await self.run_in_executor(
+                _remove_favorite, source_camera, rec_id
+            )
+        except ValueError as exc:
+            self.response_error(HTTPStatus.BAD_REQUEST, reason=str(exc))
+            return
+
+        if not removed:
+            self.response_error(
+                HTTPStatus.NOT_FOUND,
+                reason=(
+                    f"Favorite for {source_camera!r} R{rec_id} does not exist"
+                ),
+            )
+            return
+
+        await self.response_success(
+            response={
+                "status": "deleted",
+                "camera_identifier": source_camera,
+                "recording_id": rec_id,
+            }
+        )
+
+    def _create_favorite(
+        self, recording_id: int
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Synchronous favorite-creation worker (runs in executor)."""
+        with self._get_session() as session:
+            row = session.execute(
+                select(Recordings).where(Recordings.id == recording_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return None, f"Recording {recording_id} not found"
+            event = {
+                "id": row.id,
+                "camera_identifier": row.camera_identifier,
+                "type": "recording",
+                "trigger_type": row.trigger_type.value
+                if row.trigger_type is not None
+                else None,
+                "start_time": _utc_iso(row.start_time),
+                "start_timestamp": row.start_time.replace(
+                    tzinfo=datetime.timezone.utc
+                ).timestamp()
+                if row.start_time
+                else None,
+                "end_time": _utc_iso(row.end_time),
+                "end_timestamp": row.end_time.replace(
+                    tzinfo=datetime.timezone.utc
+                ).timestamp()
+                if row.end_time
+                else None,
+                "duration": (
+                    (row.end_time - row.start_time).total_seconds()
+                    if row.end_time
+                    else None
+                ),
+                "created_at": _utc_iso(row.created_at),
+                "created_at_timestamp": row.created_at.replace(
+                    tzinfo=datetime.timezone.utc
+                ).timestamp()
+                if row.created_at
+                else None,
+                "lookback": 0,
+                "hls_url": "",
+                "thumbnail_path": "",
+            }
+            disk_thumbnail_path = row.thumbnail_path
+
+        # Resolve a playable source file. Reuse the same logic the play
+        # endpoint uses (clip_path → fragment concat) so favorites work for
+        # any recording the play endpoint can play.
+        source_camera_id = event["camera_identifier"]
+        source_camera = self._get_camera(source_camera_id)
+        if source_camera is None or not hasattr(source_camera, "fragmenter"):
+            return None, (
+                f"Source camera {source_camera_id!r} for recording "
+                f"{recording_id} is not registered with a fragmenter"
+            )
+
+        # We pass source_camera as both target and source — _resolve only
+        # uses target_camera for logging.
+        playable_path, err = self._resolve_recording_path(
+            recording_id, source_camera, source_camera_id
+        )
+        if playable_path is None:
+            return None, err or "Could not resolve playable file"
+
+        os.makedirs(_favorite_dir(source_camera_id), exist_ok=True)
+        dest_video = _favorite_video_path(source_camera_id, recording_id)
+        # Copy (not move): the source may be the original tier-managed clip
+        # which we must leave alone, or a temp concatenation which the
+        # fragmenter will clean up. Either way, copy is the safe choice.
+        shutil.copyfile(playable_path, dest_video)
+
+        # Embed thumbnail as data URL so the frontend can render it without
+        # a separate auth-aware endpoint.
+        thumbnail_data_url: str | None = None
+        if disk_thumbnail_path and os.path.isfile(disk_thumbnail_path):
+            try:
+                with open(disk_thumbnail_path, "rb") as fh:
+                    raw = fh.read()
+                thumbnail_data_url = "data:image/jpeg;base64," + base64.b64encode(
+                    raw
+                ).decode("ascii")
+            except OSError:
+                LOGGER.warning(
+                    "Could not read thumbnail %s for favorite %d",
+                    disk_thumbnail_path,
+                    recording_id,
+                )
+
+        sidecar = {
+            **event,
+            "favorited_at": _isoformat_now(),
+            "video_path": dest_video,
+            "video_size": os.path.getsize(dest_video),
+            "thumbnail_path": thumbnail_data_url or "",
+        }
+        with open(
+            _favorite_sidecar_path(source_camera_id, recording_id),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(sidecar, fh)
+
+        LOGGER.info(
+            "Saved favorite recording %d (%s) to %s",
+            recording_id,
+            source_camera_id,
+            dest_video,
+        )
+        return sidecar, None
+
+
+def _scan_for_favorite(recording_id: int) -> str | None:
+    """Walk /favorites/* looking for any RNNN.mp4 matching recording_id.
+
+    Used as a last-resort lookup when the DB row is gone (e.g. after tier
+    purge) but the user is replaying from the favorites tab.
+    """
+    if not os.path.isdir(FAVORITES_DIR):
+        return None
+    target = f"R{recording_id}.mp4"
+    for sub in os.listdir(FAVORITES_DIR):
+        candidate = os.path.join(FAVORITES_DIR, sub, target)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _list_favorites() -> list[dict[str, Any]]:
+    """Read every R*.json sidecar under /favorites/ and return them sorted.
+
+    Sorted newest-first by ``created_at_timestamp`` (or ``favorited_at`` as
+    a fallback). Sidecars whose mp4 has been removed out-of-band are
+    skipped — the favorite is treated as gone.
+    """
+    if not os.path.isdir(FAVORITES_DIR):
+        return []
+    entries: list[dict[str, Any]] = []
+    for sub in sorted(os.listdir(FAVORITES_DIR)):
+        sub_dir = os.path.join(FAVORITES_DIR, sub)
+        if not os.path.isdir(sub_dir):
+            continue
+        for name in sorted(os.listdir(sub_dir)):
+            if not name.startswith("R") or not name.endswith(".json"):
+                continue
+            sidecar_path = os.path.join(sub_dir, name)
+            try:
+                with open(sidecar_path, "r", encoding="utf-8") as fh:
+                    sidecar = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                LOGGER.warning("Skipping unreadable favorite %s", sidecar_path)
+                continue
+            video_path = sidecar.get("video_path")
+            if not video_path or not os.path.isfile(video_path):
+                continue
+            entries.append(sidecar)
+    entries.sort(
+        key=lambda e: e.get("created_at_timestamp")
+        or e.get("favorited_at")
+        or 0,
+        reverse=True,
+    )
+    return entries
+
+
+def _remove_favorite(source_camera: str, recording_id: int) -> bool:
+    """Delete the video + sidecar for a favorite. Returns True if anything
+    was actually removed."""
+    video = _favorite_video_path(source_camera, recording_id)
+    sidecar = _favorite_sidecar_path(source_camera, recording_id)
+    removed = False
+    for path in (video, sidecar):
+        if os.path.isfile(path):
+            try:
+                os.unlink(path)
+                removed = True
+            except OSError:
+                LOGGER.exception("Failed to remove favorite file %s", path)
+    # Clean up empty camera dir.
+    cam_dir = _favorite_dir(source_camera)
+    if os.path.isdir(cam_dir) and not os.listdir(cam_dir):
+        try:
+            os.rmdir(cam_dir)
+        except OSError:
+            pass
+    return removed
+
 
 def _isoformat_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -271,3 +633,11 @@ def _isoformat(timestamp: float | None) -> str | None:
     return datetime.datetime.fromtimestamp(
         timestamp, tz=datetime.timezone.utc
     ).isoformat()
+
+
+def _utc_iso(value: datetime.datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.timezone.utc)
+    return value.isoformat()

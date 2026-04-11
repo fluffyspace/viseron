@@ -527,8 +527,11 @@ function Playback() {
   const playbackState = usePlaybackState(targetId || null);
   const playMutation = usePlayRecording();
   const stopMutation = useStopPlayback();
-  const { favorites, isFavorite, toggle: toggleFavorite } =
-    usePlaybackFavorites();
+  const {
+    favorites,
+    isFavorite,
+    toggle: toggleFavorite,
+  } = usePlaybackFavorites();
 
   // Tab state — "recent" browses by date, "favorites" shows the persisted
   // localStorage list regardless of date.
@@ -557,13 +560,11 @@ function Playback() {
     );
   }, [eventQueries]);
 
-  // Favorites are stored as a flat map; render them sorted newest-first to
-  // match the recent tab's ordering.
+  // The server returns favorites already sorted newest-first; the cast is
+  // safe because PlaybackFavorite is a structural superset of
+  // CameraRecordingEvent (same fields RecordingPickerRow reads).
   const favoriteList = useMemo<types.CameraRecordingEvent[]>(
-    () =>
-      Object.values(favorites).sort(
-        (a, b) => b.created_at_timestamp - a.created_at_timestamp,
-      ),
+    () => favorites as unknown as types.CameraRecordingEvent[],
     [favorites],
   );
 
@@ -577,9 +578,14 @@ function Playback() {
 
   const handlePlay = (event: types.CameraRecordingEvent) => {
     if (!targetId) return;
+    // Always pass the source camera identifier so the backend can prefer
+    // the persisted favorite blob (under /favorites/<src>/R<id>.mp4) when
+    // it exists. For non-favorited recordings the favorite check is a
+    // cheap miss and the call falls through to the normal DB lookup.
     playMutation.mutate({
       camera_identifier: targetId,
       recording_id: event.id,
+      source_camera_identifier: event.camera_identifier,
     });
   };
 

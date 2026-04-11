@@ -216,6 +216,33 @@ export interface PlaybackStopResponse {
   camera_identifier: string;
 }
 
+/**
+ * Server-persisted favorite recording. Mirrors the sidecar JSON written by
+ * /api/v1/playback/favorites — close enough to a CameraRecordingEvent that
+ * the existing recording-row UI can render it directly. ``thumbnail_path``
+ * is a base64 ``data:image/jpeg`` URL embedded in the sidecar so the UI
+ * doesn't need a separate auth-aware fetch.
+ */
+export interface PlaybackFavorite {
+  id: number;
+  camera_identifier: string;
+  type: "recording";
+  trigger_type: "motion" | "object" | null;
+  start_time: string;
+  start_timestamp: number | null;
+  end_time: string | null;
+  end_timestamp: number | null;
+  duration: number | null;
+  created_at: string | null;
+  created_at_timestamp: number | null;
+  lookback: number;
+  hls_url: string;
+  thumbnail_path: string;
+  favorited_at: string;
+  video_path: string;
+  video_size: number;
+}
+
 export interface Cameras {
   [identifier: string]: Camera;
 }

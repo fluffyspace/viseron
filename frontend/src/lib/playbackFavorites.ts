@@ -1,98 +1,113 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  UseMutationResult,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
+import { viseronAPI } from "lib/api/client";
 import * as types from "lib/types";
 
-const STORAGE_KEY = "viseron.playback.favorites.v1";
-const STORAGE_EVENT = "viseron.playback.favorites.changed";
+export type FavoriteRecording = types.PlaybackFavorite;
 
-export type FavoriteRecording = types.CameraRecordingEvent;
-
-export type FavoritesMap = Record<string, FavoriteRecording>;
+const favoritesKey = ["playback", "favorites"] as const;
 
 export const favoriteKey = (
   camera_identifier: string,
   recording_id: number,
 ): string => `${camera_identifier}:${recording_id}`;
 
-function readFromStorage(): FavoritesMap {
-  if (typeof window === "undefined") return {};
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") {
-      return parsed as FavoritesMap;
-    }
-    return {};
-  } catch {
-    return {};
-  }
+async function fetchFavorites(): Promise<FavoriteRecording[]> {
+  const response = await viseronAPI.get<{ favorites: FavoriteRecording[] }>(
+    "playback/favorites",
+  );
+  return response.data.favorites ?? [];
 }
 
-function writeToStorage(map: FavoritesMap) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
-    window.dispatchEvent(new CustomEvent(STORAGE_EVENT));
-  } catch {
-    // Quota or serialization failure — silently ignore. The in-memory state
-    // still works for this session.
-  }
+async function postFavorite(recording_id: number): Promise<FavoriteRecording> {
+  const response = await viseronAPI.post<FavoriteRecording>(
+    "playback/favorites",
+    { recording_id },
+  );
+  return response.data;
+}
+
+async function deleteFavorite(
+  camera_identifier: string,
+  recording_id: number,
+): Promise<void> {
+  await viseronAPI.delete(
+    `playback/favorites/${camera_identifier}/${recording_id}`,
+  );
 }
 
 /**
- * Hook returning the playback favorites map plus mutators. Persists to
- * localStorage and reacts to changes from other tabs / other consumers via a
- * custom window event so multiple components stay in sync.
+ * Hook returning the playback favorites list plus mutators. Backed by the
+ * server-side ``/api/v1/playback/favorites`` endpoints — the actual video
+ * file is copied into a host-mounted directory outside any storage tier so
+ * favorites stay playable indefinitely (even after the original recording
+ * is purged from tier 3).
  */
 export function usePlaybackFavorites() {
-  const [favorites, setFavorites] = useState<FavoritesMap>(() =>
-    readFromStorage(),
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: favoritesKey,
+    queryFn: fetchFavorites,
+    staleTime: 30_000,
+  });
+
+  const favorites: FavoriteRecording[] = query.data ?? [];
+  const favoriteSet = new Set(
+    favorites.map((f) => favoriteKey(f.camera_identifier, f.id)),
   );
 
-  useEffect(() => {
-    const refresh = () => setFavorites(readFromStorage());
-    window.addEventListener(STORAGE_EVENT, refresh);
-    window.addEventListener("storage", refresh);
-    return () => {
-      window.removeEventListener(STORAGE_EVENT, refresh);
-      window.removeEventListener("storage", refresh);
-    };
-  }, []);
+  const isFavorite = (event: types.CameraRecordingEvent): boolean =>
+    favoriteSet.has(favoriteKey(event.camera_identifier, event.id));
 
-  const isFavorite = useCallback(
-    (event: types.CameraRecordingEvent) =>
-      favoriteKey(event.camera_identifier, event.id) in favorites,
-    [favorites],
-  );
-
-  const toggle = useCallback((event: types.CameraRecordingEvent) => {
-    setFavorites((prev) => {
-      const key = favoriteKey(event.camera_identifier, event.id);
-      const next = { ...prev };
-      if (key in next) {
-        delete next[key];
-      } else {
-        next[key] = event;
-      }
-      writeToStorage(next);
-      return next;
-    });
-  }, []);
-
-  const remove = useCallback(
-    (camera_identifier: string, recording_id: number) => {
-      setFavorites((prev) => {
-        const key = favoriteKey(camera_identifier, recording_id);
-        if (!(key in prev)) return prev;
-        const next = { ...prev };
-        delete next[key];
-        writeToStorage(next);
-        return next;
-      });
+  const addMutation: UseMutationResult<
+    FavoriteRecording,
+    types.APIErrorResponse,
+    types.CameraRecordingEvent
+  > = useMutation({
+    mutationFn: (event: types.CameraRecordingEvent) => postFavorite(event.id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: favoritesKey });
     },
-    [],
-  );
+  });
 
-  return { favorites, isFavorite, toggle, remove };
+  const removeMutation: UseMutationResult<
+    void,
+    types.APIErrorResponse,
+    { camera_identifier: string; recording_id: number }
+  > = useMutation({
+    mutationFn: ({ camera_identifier, recording_id }) =>
+      deleteFavorite(camera_identifier, recording_id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: favoritesKey });
+    },
+  });
+
+  const toggle = (event: types.CameraRecordingEvent) => {
+    if (isFavorite(event)) {
+      removeMutation.mutate({
+        camera_identifier: event.camera_identifier,
+        recording_id: event.id,
+      });
+    } else {
+      addMutation.mutate(event);
+    }
+  };
+
+  const remove = (camera_identifier: string, recording_id: number) => {
+    removeMutation.mutate({ camera_identifier, recording_id });
+  };
+
+  return {
+    favorites,
+    isFavorite,
+    toggle,
+    remove,
+    isLoading: query.isPending,
+    isError: query.isError,
+  };
 }

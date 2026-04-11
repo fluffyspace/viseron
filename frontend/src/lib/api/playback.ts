@@ -24,10 +24,13 @@ async function fetchPlaybackState(
 async function postPlay(
   camera_identifier: string,
   recording_id: number,
+  source_camera_identifier?: string,
 ): Promise<types.PlaybackPlayResponse> {
   const response = await viseronAPI.post<types.PlaybackPlayResponse>(
     `playback/${camera_identifier}/play`,
-    { recording_id },
+    source_camera_identifier
+      ? { recording_id, source_camera_identifier }
+      : { recording_id },
   );
   return response.data;
 }
@@ -55,6 +58,7 @@ export function usePlaybackState(
 type PlayVariables = {
   camera_identifier: string;
   recording_id: number;
+  source_camera_identifier?: string;
 };
 
 export function usePlayRecording(): UseMutationResult<
@@ -64,8 +68,12 @@ export function usePlayRecording(): UseMutationResult<
 > {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ camera_identifier, recording_id }: PlayVariables) =>
-      postPlay(camera_identifier, recording_id),
+    mutationFn: ({
+      camera_identifier,
+      recording_id,
+      source_camera_identifier,
+    }: PlayVariables) =>
+      postPlay(camera_identifier, recording_id, source_camera_identifier),
     onSuccess: async (_data, variables) => {
       await queryClient.invalidateQueries({
         queryKey: playbackKey(variables.camera_identifier),
