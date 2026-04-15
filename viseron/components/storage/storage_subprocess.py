@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 import multiprocessing as mp
+import os
 import sys
 import time
+import tracemalloc
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Literal
@@ -17,6 +20,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from manager import connect
 from viseron.components.storage.check_tier import Worker
+from viseron.const import ENV_PROFILE_MEMORY
+from viseron.helpers import log_memory_summary
 from viseron.helpers.subprocess_worker import SubProcessWorker
 from viseron.watchdog.subprocess_watchdog import RestartablePopen
 from viseron.watchdog.thread_watchdog import RestartableThread, ThreadWatchDog
@@ -278,6 +283,10 @@ def main() -> None:
     parser = get_parser()
     args = parser.parse_args()
     setup_logger(args.loglevel)
+    # Start tracemalloc as early as possible when profiling is enabled so we
+    # capture allocations for imports that happen below.
+    if os.getenv(ENV_PROFILE_MEMORY) == "true" and not tracemalloc.is_tracing():
+        tracemalloc.start()
     process_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile]
     output_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile]
     process_queue, output_queue = connect(
@@ -296,6 +305,23 @@ def main() -> None:
     background_scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
     background_scheduler.start()
     ThreadWatchDog(background_scheduler)
+
+    # Log RSS + (optional) tracemalloc after the subprocess has settled, and
+    # periodically afterwards. Runs unconditionally so we always get RSS
+    # numbers; tracemalloc output only appears when profiling is enabled.
+    background_scheduler.add_job(
+        log_memory_summary,
+        "date",
+        run_date=datetime.datetime.now(tz=datetime.timezone.utc)
+        + datetime.timedelta(seconds=30),
+        args=[LOGGER, None, "storage subprocess startup-settled memory summary"],
+    )
+    background_scheduler.add_job(
+        log_memory_summary,
+        "interval",
+        minutes=10,
+        args=[LOGGER, None, "storage subprocess periodic memory summary"],
+    )
 
     LOGGER.debug(f"Starting {args.workers} worker threads")
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import datetime
 import json
 import logging
 import multiprocessing.process
@@ -57,7 +58,12 @@ from viseron.domains import setup_domains
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.events import Event, EventData
 from viseron.exceptions import DataStreamNotLoaded
-from viseron.helpers import memory_usage_profiler, parse_size_to_bytes, utcnow
+from viseron.helpers import (
+    log_memory_summary,
+    memory_usage_profiler,
+    parse_size_to_bytes,
+    utcnow,
+)
 from viseron.helpers.json import JSONEncoder
 from viseron.helpers.logs import (
     LOG_DATE_FORMAT,
@@ -652,6 +658,22 @@ class Viseron:
             self.background_scheduler.add_job(
                 memory_usage_profiler, "interval", seconds=5, args=[LOGGER]
             )
+        # One-shot settled-state memory summary, plus a periodic summary.
+        # Independent of tracemalloc so we still get RSS/SharedFrames numbers
+        # even when VISERON_PROFILE_MEMORY is not set.
+        self.background_scheduler.add_job(
+            log_memory_summary,
+            "date",
+            run_date=datetime.datetime.now(tz=datetime.timezone.utc)
+            + datetime.timedelta(seconds=30),
+            args=[LOGGER, self, "startup-settled memory summary"],
+        )
+        self.background_scheduler.add_job(
+            log_memory_summary,
+            "interval",
+            minutes=10,
+            args=[LOGGER, self, "periodic memory summary"],
+        )
 
 
 def wait_for_threads_and_processes_to_exit(

@@ -771,6 +771,123 @@ def memory_usage_profiler(logger, key_type="lineno", limit=5) -> None:
     logger.debug(log_message)
 
 
+def get_process_rss() -> dict[str, int]:
+    """Return RSS/VMS/shared for the current process in bytes."""
+    try:
+        proc = psutil.Process()
+        info = proc.memory_info()
+        full = None
+        try:
+            full = proc.memory_full_info()
+        except (psutil.AccessDenied, AttributeError):
+            pass
+        return {
+            "rss": info.rss,
+            "vms": info.vms,
+            "shared": getattr(info, "shared", 0) or 0,
+            "uss": getattr(full, "uss", 0) if full else 0,
+            "pss": getattr(full, "pss", 0) if full else 0,
+        }
+    except Exception:  # pylint: disable=broad-except
+        return {"rss": 0, "vms": 0, "shared": 0, "uss": 0, "pss": 0}
+
+
+def tracemalloc_top_by_file(limit: int = 15) -> list[dict[str, Any]]:
+    """Return top tracemalloc allocators grouped by filename."""
+    if not tracemalloc.is_tracing():
+        return []
+    snapshot = tracemalloc.take_snapshot().filter_traces(
+        (
+            tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+            tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
+            tracemalloc.Filter(False, "<unknown>"),
+            tracemalloc.Filter(False, tracemalloc.__file__),
+        )
+    )
+    stats = snapshot.statistics("filename")
+    out = []
+    for stat in stats[:limit]:
+        frame = stat.traceback[0]
+        filename = os.sep.join(frame.filename.split(os.sep)[-3:])
+        out.append(
+            {
+                "file": filename,
+                "size_bytes": stat.size,
+                "count": stat.count,
+            }
+        )
+    other_size = sum(stat.size for stat in stats[limit:])
+    if other_size:
+        out.append(
+            {"file": f"... {len(stats) - limit} other", "size_bytes": other_size, "count": 0}
+        )
+    return out
+
+
+def shared_frames_report(vis) -> list[dict[str, Any]]:
+    """Return per-camera SharedFrames occupancy. Best-effort; skips on error."""
+    out: list[dict[str, Any]] = []
+    try:
+        cameras = vis.get_registered_identifiers("camera")
+    except Exception:  # pylint: disable=broad-except
+        return out
+    for identifier, camera in cameras.items():
+        try:
+            frames_dict = camera.shared_frames._frames  # pylint: disable=protected-access
+            count = len(frames_dict)
+            nbytes = 0
+            for arr in frames_dict.values():
+                try:
+                    nbytes += int(arr.nbytes)
+                except AttributeError:
+                    pass
+            out.append(
+                {
+                    "camera": identifier,
+                    "frame_count": count,
+                    "bytes": nbytes,
+                }
+            )
+        except Exception:  # pylint: disable=broad-except
+            continue
+    return out
+
+
+def log_memory_summary(logger, vis=None, label: str = "memory summary") -> None:
+    """Log a compact memory summary: RSS + tracemalloc-by-file + SharedFrames."""
+    rss = get_process_rss()
+    lines = [
+        f"=== {label} (pid {os.getpid()}) ===",
+        f"RSS={rss['rss'] / 1024 / 1024:.1f} MiB  "
+        f"VMS={rss['vms'] / 1024 / 1024:.1f} MiB  "
+        f"USS={rss['uss'] / 1024 / 1024:.1f} MiB  "
+        f"PSS={rss['pss'] / 1024 / 1024:.1f} MiB",
+    ]
+    top = tracemalloc_top_by_file()
+    if top:
+        lines.append("tracemalloc top-by-file:")
+        for entry in top:
+            lines.append(
+                f"  {entry['size_bytes'] / 1024 / 1024:7.2f} MiB  {entry['file']}"
+            )
+    else:
+        lines.append("tracemalloc not active (set VISERON_PROFILE_MEMORY=true)")
+    if vis is not None:
+        frames = shared_frames_report(vis)
+        if frames:
+            total = sum(f["bytes"] for f in frames)
+            lines.append(
+                f"SharedFrames total={total / 1024 / 1024:.1f} MiB across "
+                f"{len(frames)} cameras:"
+            )
+            for entry in frames:
+                lines.append(
+                    f"  {entry['camera']}: {entry['frame_count']} frames, "
+                    f"{entry['bytes'] / 1024 / 1024:.1f} MiB"
+                )
+    logger.info("\n".join(lines))
+
+
 def caller_name(skip=2) -> str:
     """Get a name of a caller in the format module.class.method.
 
