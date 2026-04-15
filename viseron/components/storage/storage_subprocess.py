@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import datetime
 import logging
 import multiprocessing as mp
@@ -35,6 +37,38 @@ if TYPE_CHECKING:
     from viseron import Viseron
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _load_malloc_trim() -> "Callable[[], None] | None":
+    """Resolve glibc's malloc_trim so we can return freed heap to the OS.
+
+    check_tier loads numpy arrays of file metadata that can briefly grow to
+    hundreds of MiB (the files table has ~1M rows). Python frees those
+    allocations, but glibc keeps them in per-thread arenas. Calling
+    malloc_trim(0) after each cycle hands the pages back so the subprocess
+    RSS actually shrinks instead of staying at peak.
+    """
+    libname = ctypes.util.find_library("c")
+    if not libname:
+        return None
+    try:
+        libc = ctypes.CDLL(libname)
+    except OSError:
+        return None
+    trim = getattr(libc, "malloc_trim", None)
+    if trim is None:
+        return None
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return lambda: trim(0)
+
+
+def _malloc_trim_job(trim: "Callable[[], None]") -> None:
+    """Scheduled job that trims glibc's heap."""
+    try:
+        trim()
+    except Exception:  # pylint: disable=broad-except
+        LOGGER.exception("malloc_trim failed")
 
 
 @dataclass
@@ -322,6 +356,17 @@ def main() -> None:
         minutes=10,
         args=[LOGGER, None, "storage subprocess periodic memory summary"],
     )
+
+    trim = _load_malloc_trim()
+    if trim is not None:
+        background_scheduler.add_job(
+            _malloc_trim_job,
+            "interval",
+            minutes=5,
+            args=[trim],
+        )
+    else:
+        LOGGER.debug("malloc_trim unavailable on this platform")
 
     LOGGER.debug(f"Starting {args.workers} worker threads")
 
