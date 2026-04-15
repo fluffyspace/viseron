@@ -854,38 +854,48 @@ def shared_frames_report(vis) -> list[dict[str, Any]]:
 
 
 def log_memory_summary(logger, vis=None, label: str = "memory summary") -> None:
-    """Log a compact memory summary: RSS + tracemalloc-by-file + SharedFrames."""
+    """Log a compact memory summary: RSS + tracemalloc-by-file + SharedFrames.
+
+    Emits one logger.info call per line. Emitting a multi-line record would be
+    split by the subprocess LogPipe parser which treats each stdout line's
+    first space-separated token as a level name, mangling continuation lines.
+    """
     rss = get_process_rss()
-    lines = [
-        f"=== {label} (pid {os.getpid()}) ===",
-        f"RSS={rss['rss'] / 1024 / 1024:.1f} MiB  "
-        f"VMS={rss['vms'] / 1024 / 1024:.1f} MiB  "
-        f"USS={rss['uss'] / 1024 / 1024:.1f} MiB  "
-        f"PSS={rss['pss'] / 1024 / 1024:.1f} MiB",
-    ]
+    logger.info("=== %s (pid %d) ===", label, os.getpid())
+    logger.info(
+        "RSS=%.1f MiB  VMS=%.1f MiB  USS=%.1f MiB  PSS=%.1f MiB",
+        rss["rss"] / 1024 / 1024,
+        rss["vms"] / 1024 / 1024,
+        rss["uss"] / 1024 / 1024,
+        rss["pss"] / 1024 / 1024,
+    )
     top = tracemalloc_top_by_file()
     if top:
-        lines.append("tracemalloc top-by-file:")
+        logger.info("tracemalloc top-by-file:")
         for entry in top:
-            lines.append(
-                f"  {entry['size_bytes'] / 1024 / 1024:7.2f} MiB  {entry['file']}"
+            logger.info(
+                "tracemalloc %7.2f MiB  %s",
+                entry["size_bytes"] / 1024 / 1024,
+                entry["file"],
             )
     else:
-        lines.append("tracemalloc not active (set VISERON_PROFILE_MEMORY=true)")
+        logger.info("tracemalloc not active (set VISERON_PROFILE_MEMORY=true)")
     if vis is not None:
         frames = shared_frames_report(vis)
         if frames:
             total = sum(f["bytes"] for f in frames)
-            lines.append(
-                f"SharedFrames total={total / 1024 / 1024:.1f} MiB across "
-                f"{len(frames)} cameras:"
+            logger.info(
+                "SharedFrames total=%.1f MiB across %d cameras:",
+                total / 1024 / 1024,
+                len(frames),
             )
             for entry in frames:
-                lines.append(
-                    f"  {entry['camera']}: {entry['frame_count']} frames, "
-                    f"{entry['bytes'] / 1024 / 1024:.1f} MiB"
+                logger.info(
+                    "SharedFrames   %s: %d frames, %.1f MiB",
+                    entry["camera"],
+                    entry["frame_count"],
+                    entry["bytes"] / 1024 / 1024,
                 )
-    logger.info("\n".join(lines))
 
 
 def caller_name(skip=2) -> str:
