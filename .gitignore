@@ -83,6 +83,8 @@
 !/requirements-3.9.txt
 !setup.py
 !manager.py
+!/subprocess_workers
+!/subprocess_workers/**
 
 # Frontend
 !/frontend

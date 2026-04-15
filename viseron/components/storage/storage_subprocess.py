@@ -1,153 +1,67 @@
-"""Check storage tiers in a subprocess."""
+"""Parent-side handle for the storage tier-check subprocess.
+
+The actual worker runs from ``subprocess_workers/storage_tier_subprocess.py``
+(top-level, outside the viseron package) so it can stay lean — it does
+not need opencv, scipy, or the rest of the viseron import graph to move
+and delete files. This module contains only the parent-side glue:
+
+* ``TierCheckWorker`` — spawns and talks to the subprocess via the
+  shared manager queue.
+* Re-exports the three ``DataItem*`` dataclasses from their new home so
+  existing callers (``tier_handler``, ``check_tier``) keep working.
+"""
 
 from __future__ import annotations
 
-import argparse
-import ctypes
-import ctypes.util
-import datetime
-import logging
-import multiprocessing as mp
-import os
-import sys
-import time
-import tracemalloc
-from dataclasses import dataclass
-from queue import Empty, Queue
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
-import psutil
-import setproctitle
-from apscheduler.schedulers.background import BackgroundScheduler
+from subprocess_workers.storage_tier_messages import (
+    DataItem,
+    DataItemDeleteFile,
+    DataItemMoveFile,
+)
 
-from manager import connect
-from viseron.components.storage.check_tier import Worker
-from viseron.const import ENV_PROFILE_MEMORY
-from viseron.helpers import log_memory_summary
 from viseron.helpers.subprocess_worker import SubProcessWorker
 from viseron.watchdog.subprocess_watchdog import RestartablePopen
-from viseron.watchdog.thread_watchdog import RestartableThread, ThreadWatchDog
 
 if TYPE_CHECKING:
-    import datetime
+    import logging
     from collections.abc import Callable
-
-    import numpy as np
 
     from viseron import Viseron
 
-LOGGER = logging.getLogger(__name__)
+    _LOGGER: logging.Logger
 
-
-def _load_malloc_trim() -> "Callable[[], None] | None":
-    """Resolve glibc's malloc_trim so we can return freed heap to the OS.
-
-    check_tier loads numpy arrays of file metadata that can briefly grow to
-    hundreds of MiB (the files table has ~1M rows). Python frees those
-    allocations, but glibc keeps them in per-thread arenas. Calling
-    malloc_trim(0) after each cycle hands the pages back so the subprocess
-    RSS actually shrinks instead of staying at peak.
-    """
-    libname = ctypes.util.find_library("c")
-    if not libname:
-        return None
-    try:
-        libc = ctypes.CDLL(libname)
-    except OSError:
-        return None
-    trim = getattr(libc, "malloc_trim", None)
-    if trim is None:
-        return None
-    trim.argtypes = [ctypes.c_size_t]
-    trim.restype = ctypes.c_int
-    return lambda: trim(0)
-
-
-def _malloc_trim_job(trim: "Callable[[], None]") -> None:
-    """Scheduled job that trims glibc's heap."""
-    try:
-        trim()
-    except Exception:  # pylint: disable=broad-except
-        LOGGER.exception("malloc_trim failed")
-
-
-@dataclass
-class DataItem:
-    """Data item to be processed by the worker."""
-
-    cmd: Literal["check_tier"]
-    camera_identifier: str
-    tier_id: int
-    category: str
-    subcategories: list[str]
-    throttle_period: datetime.timedelta
-    max_bytes: int
-    min_age: datetime.timedelta
-    max_age: datetime.timedelta
-    min_bytes: int
-    drain: bool
-    files_enabled: bool = True
-    events_enabled: bool = False
-    events_max_bytes: int | None = None
-    events_min_age: datetime.timedelta | None = None
-    events_max_age: datetime.timedelta | None = None
-    events_min_bytes: int | None = None
-    callback_id: str | None = None
-    data: np.ndarray | None = None
-    error: str | None = None
-
-    @property
-    def throttle_key(self) -> str:
-        """Generate a unique key for throttling."""
-        return (
-            f"{self.camera_identifier}_"
-            f"{self.tier_id}_{self.category}_"
-            f"{self.subcategories[0]}"
-        )
-
-
-@dataclass
-class DataItemMoveFile:
-    """Data item to be processed by the worker for moving files."""
-
-    cmd: Literal["move_file"]
-    src: str
-    dst: str
-    callback_id: str | None = None
-    error: str | None = None
-
-
-@dataclass
-class DataItemDeleteFile:
-    """Data item to be processed by the worker for deleting files."""
-
-    cmd: Literal["delete_file"]
-    src: str
-    callback_id: str | None = None
-    error: str | None = None
+__all__ = [
+    "DataItem",
+    "DataItemDeleteFile",
+    "DataItemMoveFile",
+    "TierCheckWorker",
+]
 
 
 class TierCheckWorker(SubProcessWorker):
-    """Check tiers in a separate subprocess."""
+    """Spawn and forward jobs to the storage tier-check subprocess."""
 
-    def __init__(self, vis: Viseron, cpulimit: int | None, workers: int) -> None:
+    def __init__(self, vis: "Viseron", cpulimit: int | None, workers: int) -> None:
         self._cpulimit = cpulimit
         self._workers = workers
         self._callbacks: dict[
-            str, Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]
+            str,
+            "Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]",
         ] = {}
         super().__init__(vis, f"{__name__}.tier_check_worker", qsize=0)
 
     def spawn_subprocess(self) -> RestartablePopen:
-        """Spawn subprocess."""
+        """Spawn the standalone subprocess entry script."""
         return RestartablePopen(
             (
-                "python3 -u viseron/components/storage/storage_subprocess.py "
+                "python3 -u subprocess_workers/storage_tier_subprocess.py "
                 f"--manager-port {self._server_port} "
                 f"--manager-authkey {self._authkey_store.authkey} "
                 f"--cpulimit {self._cpulimit} "
                 f"--workers {self._workers} "
-                f"--loglevel DEBUG"
+                "--loglevel DEBUG"
             ).split(" "),
             name=self.subprocess_name,
             stdout=self._log_pipe,
@@ -157,10 +71,10 @@ class TierCheckWorker(SubProcessWorker):
     def send_command(
         self,
         item: DataItem | DataItemMoveFile | DataItemDeleteFile,
-        callback: Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]
+        callback: "Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]"
         | None,
     ) -> None:
-        """Send command to the subprocess."""
+        """Forward a job to the subprocess, remembering its callback."""
         if callback is not None:
             item.callback_id = str(id(callback))
             self._callbacks[item.callback_id] = callback
@@ -169,248 +83,9 @@ class TierCheckWorker(SubProcessWorker):
     def work_output(
         self, item: DataItem | DataItemMoveFile | DataItemDeleteFile
     ) -> None:
-        """Perform work on output item from child process."""
+        """Dispatch the subprocess's reply to the original caller."""
         if not item.callback_id:
             return
-
         callback = self._callbacks.pop(item.callback_id, None)
         if callback:
             callback(item)
-        else:
-            LOGGER.warning("No callback found")
-
-
-def setup_logger(loglevel: str) -> None:
-    """Log to stdout without any formatting.
-
-    Viserons main log formatter takes care of the format in the main process.
-    """
-    root = logging.getLogger()
-    root.setLevel(loglevel)
-
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(loglevel)
-    formatter = logging.Formatter("%(levelname)s %(message)s")
-    handler.setFormatter(formatter)
-    root.addHandler(handler)
-
-
-def get_parser() -> argparse.ArgumentParser:
-    """Get parser for script."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--manager-port", help="Port for the Manager", required=True)
-    parser.add_argument(
-        "--manager-authkey", help="Password for the Manager", required=True
-    )
-
-    parser.add_argument(
-        "--cpulimit",
-        help="CPU limit for the subprocess",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--workers",
-        help="Number of worker threads",
-        type=int,
-        default=4,
-    )
-    parser.add_argument(
-        "--loglevel",
-        help="Loglevel",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-    )
-    return parser
-
-
-def initializer(cpulimit: int | None) -> None:
-    """Initialize engine in process."""
-    # Limit CPU by spawning cpulimit
-    pid = mp.current_process().pid
-    if pid:
-        ps = psutil.Process(pid)
-        ps.nice(20)
-    if pid and cpulimit is not None:
-        command = ["cpulimit", "-l", str(cpulimit), "-p", str(pid), "-z", "-q"]
-        LOGGER.debug(f"Running command: {command}")
-        RestartablePopen(
-            command,
-            register=False,
-        )
-    # Set process name
-    setproctitle.setproctitle(f"viseron_storage_subprocess_{pid}")
-
-
-def worker_task_files(
-    worker: Worker,
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile],
-    output_queue: Queue[DataItemDeleteFile | DataItemMoveFile],
-) -> None:
-    """Worker thread that only processes file operation commands."""
-    while True:
-        try:
-            job = file_queue.get(timeout=1)
-            worker.work_input(job)
-            output_queue.put(job)
-        except Empty:
-            continue
-        except Exception:  # pylint: disable=broad-except
-            LOGGER.exception("Error in file worker thread")
-
-
-def worker_task_mixed(
-    worker: Worker,
-    check_queue: Queue[DataItem],
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile],
-    output_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile],
-    name: str,
-) -> None:
-    """Worker thread that prioritizes file operations but also handles check_tier.
-
-    This ensures that file operations are not blocked by slow check_tier jobs.
-    """
-    job: DataItem | DataItemDeleteFile | DataItemMoveFile
-    while True:
-        try:
-            try:
-                job = file_queue.get_nowait()
-            except Empty:
-                job = check_queue.get(timeout=1)
-            worker.work_input(job)
-            output_queue.put(job)
-        except Empty:
-            continue
-        except Exception:  # pylint: disable=broad-except
-            LOGGER.exception(f"Error in mixed worker thread {name}")
-
-
-def dispatcher_task(
-    process_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile],
-    check_queue: Queue[DataItem],
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile],
-) -> None:
-    """Dispatcher thread routing jobs to dedicated queues.
-
-    check_tier commands can be slow. File operations should not be blocked by them,
-    so they get their own queue and worker.
-    """
-    while True:
-        try:
-            job = process_queue.get(timeout=1)
-        except Empty:
-            continue
-
-        try:
-            if job.cmd == "check_tier":
-                check_queue.put(job)
-            elif job.cmd in ("move_file", "delete_file"):
-                file_queue.put(job)
-            else:
-                LOGGER.debug("Unknown command %s", job.cmd)
-        except Exception:  # pylint: disable=broad-except
-            LOGGER.exception("Dispatcher error routing job")
-
-
-def main() -> None:
-    """Run tier check in a subprocess."""
-    parser = get_parser()
-    args = parser.parse_args()
-    setup_logger(args.loglevel)
-    # Start tracemalloc as early as possible when profiling is enabled so we
-    # capture allocations for imports that happen below.
-    if os.getenv(ENV_PROFILE_MEMORY) == "true" and not tracemalloc.is_tracing():
-        tracemalloc.start()
-    process_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile]
-    output_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile]
-    process_queue, output_queue = connect(
-        "127.0.0.1", int(args.manager_port), args.manager_authkey
-    )
-
-    initializer(
-        cpulimit=args.cpulimit,
-    )
-
-    worker = Worker()
-    # Run scheduler and watchdog in the subprocess since the Viseron main process
-    # watchdog is not available in the subprocess.
-    logging.getLogger("apscheduler.scheduler").setLevel(logging.ERROR)
-    logging.getLogger("apscheduler.executors").setLevel(logging.ERROR)
-    background_scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
-    background_scheduler.start()
-    ThreadWatchDog(background_scheduler)
-
-    # Log RSS + (optional) tracemalloc after the subprocess has settled, and
-    # periodically afterwards. Runs unconditionally so we always get RSS
-    # numbers; tracemalloc output only appears when profiling is enabled.
-    background_scheduler.add_job(
-        log_memory_summary,
-        "date",
-        run_date=datetime.datetime.now(tz=datetime.timezone.utc)
-        + datetime.timedelta(seconds=30),
-        args=[LOGGER, None, "storage subprocess startup-settled memory summary"],
-    )
-    background_scheduler.add_job(
-        log_memory_summary,
-        "interval",
-        minutes=10,
-        args=[LOGGER, None, "storage subprocess periodic memory summary"],
-    )
-
-    trim = _load_malloc_trim()
-    if trim is not None:
-        background_scheduler.add_job(
-            _malloc_trim_job,
-            "interval",
-            minutes=5,
-            args=[trim],
-        )
-    else:
-        LOGGER.debug("malloc_trim unavailable on this platform")
-
-    LOGGER.debug(f"Starting {args.workers} worker threads")
-
-    check_queue: Queue[DataItem] = Queue()
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile] = Queue()
-
-    dispatcher = RestartableThread(
-        name="storage_subprocess.dispatcher",
-        target=dispatcher_task,
-        args=(process_queue, check_queue, file_queue),
-        daemon=True,
-    )
-    dispatcher.start()
-
-    for i in range(args.workers):
-        thread = RestartableThread(
-            name=f"storage_subprocess.mixed_worker.{i}",
-            target=worker_task_mixed,
-            args=(
-                worker,
-                check_queue,
-                file_queue,
-                output_queue,
-                f"mixed_worker.{i}",
-            ),
-            daemon=True,
-        )
-        thread.start()
-
-    thread = RestartableThread(
-        name="storage_subprocess.file_worker",
-        target=worker_task_files,
-        args=(worker, file_queue, output_queue),
-        daemon=True,
-    )
-    thread.start()
-
-    while True:
-        time.sleep(1)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        LOGGER.debug("Storage tier check subprocess interrupted by user")
-        sys.exit(0)
