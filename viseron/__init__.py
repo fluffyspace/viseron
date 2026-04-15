@@ -245,6 +245,12 @@ def setup_viseron(vis: Viseron) -> None:
     setup_domains(vis)
     vis.setup()
 
+    # Initialise the replay-camera manager once the live config and domain
+    # registry are populated. It sits idle until playback / test-runner
+    # asks it to spawn a replay camera.
+    from viseron.helpers.replay_camera import get_or_create_manager
+    get_or_create_manager(vis, config)
+
     if vis.safe_mode:
         LOGGER.warning("Viseron is running in safe mode")
     else:
