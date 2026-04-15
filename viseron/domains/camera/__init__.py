@@ -205,6 +205,12 @@ class AbstractCamera(AbstractDomain):
         )
 
         self.fragmenter: Fragmenter = Fragmenter(vis, self)
+        # Real cameras fragment continuously from boot. Test and playback
+        # cameras are idle most of the time, so their fragmenter subprocess
+        # is provisioned lazily on start_camera() and released on
+        # stop_camera(). Keeps ~55+ MiB per dormant camera off the RSS.
+        if not (self.is_test_camera or self.is_playback_camera):
+            self.fragmenter.start()
         if self.config[CONFIG_PASSWORD]:
             self._sensitive_string_tracker.add_sensitive_string(
                 self.config[CONFIG_PASSWORD]
@@ -278,6 +284,9 @@ class AbstractCamera(AbstractDomain):
     def start_camera(self) -> None:
         """Start camera streaming."""
         self.stopped.clear()
+        # Idempotent — real cameras already started their fragmenter in
+        # __init__; this activates it for test/playback cameras.
+        self.fragmenter.start()
         self._start_camera()
         self._vis.dispatch_event(
             EVENT_CAMERA_STARTED.format(camera_identifier=self.identifier),
@@ -300,6 +309,11 @@ class AbstractCamera(AbstractDomain):
         if self.is_recording:
             self.stop_recorder()
         self.current_frame = None
+        # Release the fragmenter subprocess for cameras that are dormant
+        # between activations. Real cameras keep theirs running — stopping
+        # them here would churn the worker on any temporary camera outage.
+        if self.is_test_camera or self.is_playback_camera:
+            self.fragmenter.stop()
 
     @abstractmethod
     def _stop_camera(self) -> None:
