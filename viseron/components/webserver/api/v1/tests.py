@@ -20,13 +20,10 @@ from viseron.components.storage.queries import get_time_period_fragments
 from viseron.components.test_runner import COMPONENT as TEST_RUNNER_COMPONENT
 from viseron.components.test_runner.auto_tuner import AutoTuner
 from viseron.components.test_runner.const import KINDS
-from viseron.components.test_runner.runner import _synth_test_camera_id
 from viseron.components.webserver.api.handlers import BaseAPIHandler
 from viseron.components.webserver.auth import Role
 from viseron.const import CONFIG_DIR, RESTART_EXIT_CODE
-from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.domains.camera.fragmenter import Fragment
-from viseron.exceptions import DomainNotRegisteredError
 from viseron.helpers import create_directory
 
 if TYPE_CHECKING:
@@ -925,8 +922,9 @@ class TestsAPIHandler(BaseAPIHandler):
 
         clip_path, effective_duration, case_id = result
 
-        # Register the synthetic camera at runtime so the case is
-        # immediately runnable without a Viseron restart.
+        # Pick up the new case in the in-memory DB-case list. Cases are
+        # pure data — the runner acquires a replay camera on demand at
+        # run time, so no camera registration / restart is ever required.
         component: "TestRunnerComponent | None" = self._vis.data.get(
             TEST_RUNNER_COMPONENT
         )

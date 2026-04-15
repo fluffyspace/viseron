@@ -39,9 +39,9 @@ from .const import (
 from .runner import (
     TestRunner,
     TestRunnerComponent,
-    inject_db_cases,
     inject_yaml_cases,
     load_and_inject_tests_yaml,
+    load_db_cases,
 )
 from .tests_yaml import load_tests_yaml
 
@@ -137,15 +137,13 @@ def setup(vis: "Viseron", config: dict[str, Any]) -> bool:
         if tests_yaml is not None
         else []
     )
-    db_cases = inject_db_cases(vis, config)
+    db_cases = load_db_cases(vis)
 
-    ffmpeg_cameras = config.get("ffmpeg", {}).get("camera")
     component = TestRunnerComponent(
         vis,
         block,
         yaml_cases=yaml_cases,
         db_cases=db_cases,
-        ffmpeg_cameras=ffmpeg_cameras,
     )
     vis.data[COMPONENT] = component
 
@@ -164,8 +162,8 @@ __all__ = [
     "TestRunnerComponent",
     "KIND_MOTION",
     "KIND_OBJECT",
-    "inject_db_cases",
     "inject_yaml_cases",
     "load_and_inject_tests_yaml",
+    "load_db_cases",
     "setup",
 ]
