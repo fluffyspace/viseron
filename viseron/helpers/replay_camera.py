@@ -41,7 +41,10 @@ from viseron.domains import (
     setup_domains,
     unload_domain,
 )
-from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
+from viseron.domains.camera.const import (
+    DOMAIN as CAMERA_DOMAIN,
+    EVENT_CAMERA_STOPPED,
+)
 
 if TYPE_CHECKING:
     from viseron import Viseron
@@ -82,6 +85,9 @@ class ReplayHolder:
     purpose: Purpose
     source_path: str
     acquired_at: datetime.datetime
+    # Unsubscribe function for the EVENT_CAMERA_STOPPED listener so we can
+    # auto-release on ffmpeg EOF. Set after acquire completes.
+    unsubscribe_stopped: Any = None
 
 
 @dataclass
@@ -153,9 +159,25 @@ class ReplayCameraManager:
                 source_path=source_path,
                 acquired_at=datetime.datetime.now(tz=datetime.timezone.utc),
             )
+            # Auto-release on natural EOF: the ffmpeg EOF watcher in the
+            # playback camera pipeline calls stop_camera() which dispatches
+            # EVENT_CAMERA_STOPPED. We release from that listener so the
+            # manager's holder state reflects reality without the caller
+            # needing to poll.
+            holder.unsubscribe_stopped = self._vis.listen_event(
+                EVENT_CAMERA_STOPPED.format(camera_identifier=replay_id),
+                lambda *_: self._on_camera_stopped(token),
+            )
             with self._global_lock:
                 self._holders[real_camera_id] = holder
             return ReplayHandle(token=token, replay_camera_id=replay_id)
+
+    def _on_camera_stopped(self, token: str) -> None:
+        """Event-listener callback for EVENT_CAMERA_STOPPED."""
+        try:
+            self.release(token)
+        except Exception:  # pylint: disable=broad-except
+            LOGGER.exception("auto-release failed for token %s", token)
 
     def release(self, token: str) -> None:
         """Release a replay camera by token. Idempotent."""
@@ -177,17 +199,26 @@ class ReplayCameraManager:
                 current = self._holders.get(real_id)
                 if current is None or current.token != token:
                     return
+                # Remove from holders and unsubscribe stop-listener *before*
+                # teardown. Teardown will re-dispatch EVENT_CAMERA_STOPPED
+                # when unload_domain calls AbstractCamera.unload, and we
+                # don't want the listener to re-enter release.
+                self._holders.pop(real_id, None)
+            if holder.unsubscribe_stopped is not None:
+                try:
+                    holder.unsubscribe_stopped()
+                except Exception:  # pylint: disable=broad-except
+                    LOGGER.exception(
+                        "failed to unsubscribe stop-listener for %s",
+                        holder.replay_camera_id,
+                    )
             LOGGER.info(
                 "release: replay camera %s for %s (purpose=%s)",
                 holder.replay_camera_id,
                 real_id,
                 holder.purpose,
             )
-            try:
-                self._teardown(holder.replay_camera_id)
-            finally:
-                with self._global_lock:
-                    self._holders.pop(real_id, None)
+            self._teardown(holder.replay_camera_id)
 
     def get_holder(self, real_camera_id: str) -> ReplayHolder | None:
         """Return the current holder for a real camera, if any."""
@@ -336,12 +367,12 @@ class ReplayCameraManager:
         cloned["port"] = 554
         cloned["path"] = "/"
         cloned["file_source"] = source_path
-        if purpose == "test":
-            cloned["test_mode"] = True
-            cloned["playback_mode"] = False
-        else:
-            cloned["playback_mode"] = True
-            cloned["test_mode"] = False
+        # Always mark as playback so the EOF watcher and swap_playback_source
+        # semantics kick in — test purpose additionally stamps test_mode so
+        # detections produced by the run are tagged test=True in the DB and
+        # don't pollute live events.
+        cloned["playback_mode"] = True
+        cloned["test_mode"] = purpose == "test"
         return cloned
 
     def _inject_detection_configs(

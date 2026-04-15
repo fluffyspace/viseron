@@ -41,6 +41,10 @@ from viseron.components.storage.queries import get_recording_fragments
 from viseron.components.webserver.api.handlers import BaseAPIHandler
 from viseron.components.webserver.auth import Role
 from viseron.domains.camera.fragmenter import Fragment
+from viseron.helpers.replay_camera import (
+    ReplayBusy,
+    get_manager,
+)
 
 if TYPE_CHECKING:
     from viseron.domains.camera import AbstractCamera
@@ -139,13 +143,15 @@ class PlaybackAPIHandler(BaseAPIHandler):
     # camera + recording resolution
     # ------------------------------------------------------------------ #
 
-    def _get_playback_camera(
+    def _get_real_camera(
         self, camera_identifier: str
     ) -> AbstractCamera | None:
-        """Resolve camera and verify it is a playback camera.
+        """Resolve camera and verify it's a real camera (not a replay camera).
 
-        Returns None if not found OR not a playback camera, with the
-        appropriate error response already sent.
+        Playback acquires an on-demand *replay* camera for a real camera —
+        the URL path takes the real camera's identifier. If the caller
+        passes a replay camera id by mistake (or a non-existent id), we
+        respond with a clear error and return None.
         """
         camera = self._get_camera(camera_identifier)
         if camera is None:
@@ -154,12 +160,13 @@ class PlaybackAPIHandler(BaseAPIHandler):
                 reason=f"Camera {camera_identifier} not found",
             )
             return None
-        if not camera.is_playback_camera:
+        if camera.is_playback_camera or camera.is_test_camera:
             self.response_error(
                 HTTPStatus.BAD_REQUEST,
                 reason=(
-                    f"Camera {camera_identifier} is not a playback camera "
-                    f"(set playback_mode: true in its config)"
+                    f"Camera {camera_identifier} is itself a replay camera; "
+                    f"playback endpoints take a real camera id and spawn a "
+                    f"replay camera on demand."
                 ),
             )
             return None
@@ -271,9 +278,16 @@ class PlaybackAPIHandler(BaseAPIHandler):
     # ------------------------------------------------------------------ #
 
     async def post_play(self, camera_identifier: str) -> None:
-        """Start (or restart) playback of a recording on this camera."""
-        camera = self._get_playback_camera(camera_identifier)
-        if camera is None:
+        """Start playback of a recording against a real camera.
+
+        The URL's ``camera_identifier`` is the *real* camera whose config
+        should drive detection. A dedicated replay camera
+        (``replay_<real>``) is spawned on demand from the real camera's
+        config with ``file_source`` set to the resolved clip path, and is
+        torn down completely when playback finishes (EOF or explicit stop).
+        """
+        real_camera = self._get_real_camera(camera_identifier)
+        if real_camera is None:
             return
 
         recording_id = self.json_body["recording_id"]
@@ -282,15 +296,32 @@ class PlaybackAPIHandler(BaseAPIHandler):
         file_path, err = await self.run_in_executor(
             self._resolve_recording_path,
             recording_id,
-            camera,
+            real_camera,
             source_camera_hint,
         )
         if file_path is None:
             self.response_error(HTTPStatus.NOT_FOUND, reason=err or "Not found")
             return
 
+        manager = get_manager(self._vis)
+        if manager is None:
+            self.response_error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                reason="Replay camera manager is not initialised",
+            )
+            return
+
+        def _acquire():
+            return manager.acquire(camera_identifier, "playback", file_path)
+
         try:
-            await self.run_in_executor(camera.swap_playback_source, file_path)
+            handle = await self.run_in_executor(_acquire)
+        except ReplayBusy as exc:
+            self.response_error(
+                HTTPStatus.CONFLICT,
+                reason=str(exc),
+            )
+            return
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.exception("Playback start failed for %s", camera_identifier)
             self.response_error(
@@ -303,6 +334,8 @@ class PlaybackAPIHandler(BaseAPIHandler):
             response={
                 "status": "playing",
                 "camera_identifier": camera_identifier,
+                "replay_camera_id": handle.replay_camera_id,
+                "token": handle.token,
                 "recording_id": recording_id,
                 "file": file_path,
                 "started_at": _isoformat_now(),
@@ -310,18 +343,35 @@ class PlaybackAPIHandler(BaseAPIHandler):
         )
 
     async def post_stop(self, camera_identifier: str) -> None:
-        """Stop playback on this camera."""
-        camera = self._get_playback_camera(camera_identifier)
-        if camera is None:
+        """Stop any replay camera currently held for this real camera."""
+        real_camera = self._get_real_camera(camera_identifier)
+        if real_camera is None:
             return
 
-        def _stop() -> None:
-            with camera._playback_lock:  # pylint: disable=protected-access
-                if not camera.stopped.is_set():
-                    camera.stop_camera()
+        manager = get_manager(self._vis)
+        if manager is None:
+            self.response_error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                reason="Replay camera manager is not initialised",
+            )
+            return
 
+        holder = manager.get_holder(camera_identifier)
+        if holder is None or holder.purpose != "playback":
+            # Nothing to stop, or the replay camera is held by a test run
+            # — we don't preempt tests.
+            self.response_error(
+                HTTPStatus.NOT_FOUND,
+                reason=(
+                    f"No playback is currently active for "
+                    f"{camera_identifier!r}"
+                ),
+            )
+            return
+
+        token = holder.token
         try:
-            await self.run_in_executor(_stop)
+            await self.run_in_executor(manager.release, token)
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.exception("Playback stop failed for %s", camera_identifier)
             self.response_error(
@@ -338,22 +388,37 @@ class PlaybackAPIHandler(BaseAPIHandler):
         )
 
     async def get_status(self, camera_identifier: str) -> None:
-        """Return playback state for this camera."""
-        camera = self._get_playback_camera(camera_identifier)
-        if camera is None:
+        """Return replay state for this real camera."""
+        real_camera = self._get_real_camera(camera_identifier)
+        if real_camera is None:
+            return
+
+        manager = get_manager(self._vis)
+        if manager is None:
+            self.response_error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                reason="Replay camera manager is not initialised",
+            )
+            return
+
+        holder = manager.get_holder(camera_identifier)
+        if holder is None:
+            await self.response_success(
+                response={
+                    "camera_identifier": camera_identifier,
+                    "is_playing": False,
+                }
+            )
             return
 
         await self.response_success(
             response={
                 "camera_identifier": camera_identifier,
-                "is_playing": bool(camera.connected),
-                "is_on": bool(camera.is_on),
-                "current_file": getattr(
-                    camera, "_playback_current_file", None
-                ),
-                "started_at": _isoformat(
-                    getattr(camera, "_playback_started_at", None)
-                ),
+                "is_playing": True,
+                "purpose": holder.purpose,
+                "replay_camera_id": holder.replay_camera_id,
+                "current_file": holder.source_path,
+                "started_at": holder.acquired_at.isoformat(),
             }
         )
 
