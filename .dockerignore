@@ -7,6 +7,8 @@
 !viseron/
 !viseron/*
 !manager.py
+!subprocess_workers/
+!subprocess_workers/*
 !docker/ffmpeg_wrapper
 !docker/ffprobe_wrapper
 !requirements.txt
