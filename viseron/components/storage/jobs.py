@@ -222,42 +222,53 @@ class OrphanedFilesCleanup(BaseCleanupJob):
                 )
 
         total_files_processed = 0
-        with self._storage.get_session() as session:
-            for path in paths:
+        for path in paths:
+            if self.kill_event.is_set():
+                break
+            LOGGER.debug("%s checking %s", self.name, path)
+
+            # Pre-load all DB-tracked paths under this directory in a single
+            # short-lived query. The previous implementation held one session
+            # open across the entire filesystem walk (including slow NFS
+            # tiers) running a SELECT per file, which left a postgres
+            # connection "idle in transaction" for hours and accumulated ORM
+            # objects in the identity map.
+            with self._storage.get_session() as session:
+                db_paths: set[str] = {
+                    row[0]
+                    for row in session.execute(
+                        select(Files.path).where(Files.path.like(f"{path}/%"))
+                    ).all()
+                }
+
+            for root, _, files in os.walk(path):
                 if self.kill_event.is_set():
                     break
-                LOGGER.debug("%s checking %s", self.name, path)
-                for root, _, files in os.walk(path):
+
+                files_processed = 0
+                for file in files:
                     if self.kill_event.is_set():
                         break
 
-                    files_processed = 0
-                    for file in files:
-                        if self.kill_event.is_set():
-                            break
-
-                        total_files_processed += 1
-                        files_processed += 1
-                        if file in self._storage.ignored_files:
-                            continue
-                        file_path = os.path.join(root, file)
-                        file_exists = session.execute(
-                            select(Files).where(Files.path == file_path)
-                        ).first()
-                        if not file_exists and os.path.exists(file_path):
-                            os.remove(file_path)
-                            LOGGER.debug("%s deleted %s", self.name, file_path)
-                            deleted_count += 1
-                        self.log_progress(
-                            f"{self.name} processed {files_processed}/{len(files)} "
-                            f"files in {root}",
-                        )
-                        if total_files_processed % 100 == 0:
-                            time.sleep(1)
-                    LOGGER.debug(
+                    total_files_processed += 1
+                    files_processed += 1
+                    if file in self._storage.ignored_files:
+                        continue
+                    file_path = os.path.join(root, file)
+                    if file_path not in db_paths and os.path.exists(file_path):
+                        os.remove(file_path)
+                        LOGGER.debug("%s deleted %s", self.name, file_path)
+                        deleted_count += 1
+                    self.log_progress(
                         f"{self.name} processed {files_processed}/{len(files)} "
                         f"files in {root}",
                     )
+                    if total_files_processed % 100 == 0:
+                        time.sleep(1)
+                LOGGER.debug(
+                    f"{self.name} processed {files_processed}/{len(files)} "
+                    f"files in {root}",
+                )
 
         LOGGER.debug(
             "%s deleted %d/%d processed files, took %s",

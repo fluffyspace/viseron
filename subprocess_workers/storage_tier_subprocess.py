@@ -15,6 +15,7 @@ import argparse
 import ctypes
 import ctypes.util
 import datetime
+import gc
 import logging
 import multiprocessing as mp
 import os
@@ -126,13 +127,6 @@ def _load_malloc_trim() -> Callable[[], None] | None:
     return lambda: trim(0)
 
 
-def _malloc_trim_job(trim: Callable[[], None]) -> None:
-    try:
-        trim()
-    except Exception:  # pylint: disable=broad-except
-        LOGGER.exception("malloc_trim failed")
-
-
 def _log_memory_summary() -> None:
     """Emit RSS and (if enabled) a tracemalloc top-N breakdown.
 
@@ -205,7 +199,7 @@ def initializer(cpulimit: int | None) -> None:
 class Worker:
     """Execute tier-check and file-move commands using SQLAlchemy Core."""
 
-    def __init__(self) -> None:
+    def __init__(self, trim: Callable[[], None] | None = None) -> None:
         database_url = os.getenv(
             "POSTGRES_DATABASE_URL", "postgresql://postgres@localhost/viseron"
         )
@@ -217,6 +211,7 @@ class Worker:
             pool_pre_ping=True,
             pool_recycle=300,
         )
+        self._trim = trim
         self._last_call: dict[str, float] = {}
         self._check_locks: dict[str, threading.Lock] = {}
         self._checks_in_progress: dict[str, bool] = {}
@@ -430,6 +425,16 @@ class Worker:
             with self._check_locks[item.camera_identifier]:
                 self._last_call[item.throttle_key] = _utcnow().timestamp()
                 self._checks_in_progress[item.camera_identifier] = False
+            # Each check allocates numpy arrays over the full per-camera
+            # files set (~220K rows on this install). Python frees the
+            # refs but glibc keeps the pages — run gc then malloc_trim so
+            # RSS doesn't creep up indefinitely.
+            gc.collect()
+            if self._trim is not None:
+                try:
+                    self._trim()
+                except Exception:  # pylint: disable=broad-except
+                    LOGGER.exception("malloc_trim failed")
 
     def move_file(self, item: DataItemMoveFile) -> None:
         """Copy + unlink; falls back to DB cleanup if source is missing."""
@@ -556,7 +561,10 @@ def main() -> None:
 
     initializer(cpulimit=args.cpulimit)
 
-    worker = Worker()
+    trim = _load_malloc_trim()
+    if trim is None:
+        LOGGER.debug("malloc_trim unavailable on this platform")
+    worker = Worker(trim=trim)
 
     logging.getLogger("apscheduler.scheduler").setLevel(logging.ERROR)
     logging.getLogger("apscheduler.executors").setLevel(logging.ERROR)
@@ -569,12 +577,6 @@ def main() -> None:
         run_date=_utcnow() + datetime.timedelta(seconds=30),
     )
     scheduler.add_job(_log_memory_summary, "interval", minutes=10)
-
-    trim = _load_malloc_trim()
-    if trim is not None:
-        scheduler.add_job(_malloc_trim_job, "interval", minutes=5, args=[trim])
-    else:
-        LOGGER.debug("malloc_trim unavailable on this platform")
 
     check_queue: Queue[DataItem] = Queue()
     file_queue: Queue[DataItemDeleteFile | DataItemMoveFile] = Queue()
