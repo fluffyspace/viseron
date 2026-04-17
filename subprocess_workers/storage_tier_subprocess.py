@@ -42,7 +42,6 @@ from sqlalchemy import (
     delete,
     select,
 )
-from sqlalchemy.orm import Session, scoped_session, sessionmaker
 
 from manager import connect
 from subprocess_workers.storage_tier_compute import (
@@ -210,21 +209,20 @@ class Worker:
         database_url = os.getenv(
             "POSTGRES_DATABASE_URL", "postgresql://postgres@localhost/viseron"
         )
-        engine = create_engine(
+        self._engine = create_engine(
             database_url,
             connect_args={"options": "-c timezone=UTC"},
-            pool_size=2,
-            max_overflow=3,
-        )
-        self._get_session: Callable[[], Session] = scoped_session(
-            sessionmaker(bind=engine)
+            pool_size=1,
+            max_overflow=1,
+            pool_pre_ping=True,
+            pool_recycle=300,
         )
         self._last_call: dict[str, float] = {}
         self._check_locks: dict[str, threading.Lock] = {}
         self._checks_in_progress: dict[str, bool] = {}
 
     def _load_tier(self, item: DataItem) -> np.ndarray:
-        with self._get_session() as session:
+        with self._engine.connect() as conn:
             stmt = select(
                 FILES_TABLE.c.id, FILES_TABLE.c.size, FILES_TABLE.c.orig_ctime
             ).where(
@@ -233,7 +231,7 @@ class Worker:
                 FILES_TABLE.c.category == item.category,
                 FILES_TABLE.c.subcategory.in_(item.subcategories),
             )
-            rows = session.execute(stmt).yield_per(1000)
+            rows = conn.execute(stmt).fetchall()
             data = [
                 (row.id, row.size, int(row.orig_ctime.timestamp()))
                 for row in rows
@@ -241,7 +239,7 @@ class Worker:
         return np.array(data, dtype=FILES_COMPUTE_DTYPE)
 
     def _load_recordings(self, item: DataItem) -> np.ndarray:
-        with self._get_session() as session:
+        with self._engine.connect() as conn:
             stmt = select(
                 RECORDINGS_TABLE.c.id,
                 RECORDINGS_TABLE.c.start_time,
@@ -249,7 +247,7 @@ class Worker:
                 RECORDINGS_TABLE.c.adjusted_start_time,
                 RECORDINGS_TABLE.c.created_at,
             ).where(RECORDINGS_TABLE.c.camera_identifier == item.camera_identifier)
-            rows = session.execute(stmt).yield_per(1000)
+            rows = conn.execute(stmt).fetchall()
             now_ts = _utcnow().timestamp()
             data = [
                 (
@@ -266,11 +264,11 @@ class Worker:
     def _resolve_file_paths(self, file_ids: np.ndarray) -> np.ndarray:
         """Fetch paths for file IDs eligible to move."""
         ids_list = file_ids.tolist()
-        with self._get_session() as session:
+        with self._engine.connect() as conn:
             stmt = select(
                 FILES_TABLE.c.id, FILES_TABLE.c.path, FILES_TABLE.c.tier_path
             ).where(FILES_TABLE.c.id.in_(ids_list))
-            rows = session.execute(stmt).all()
+            rows = conn.execute(stmt).fetchall()
         path_map = {row.id: (row.path, row.tier_path) for row in rows}
         data = [
             (fid, path_map[fid][0], path_map[fid][1])
@@ -282,14 +280,14 @@ class Worker:
     def _resolve_recording_file_paths(self, ids_to_move: np.ndarray) -> np.ndarray:
         """Fetch paths for recording-file pairs, filtering to .m4s only."""
         file_ids_list = list({int(x) for x in ids_to_move["id"]})
-        with self._get_session() as session:
+        with self._engine.connect() as conn:
             stmt = select(
                 FILES_TABLE.c.id, FILES_TABLE.c.path, FILES_TABLE.c.tier_path
             ).where(
                 FILES_TABLE.c.id.in_(file_ids_list),
                 FILES_TABLE.c.path.like("%.m4s"),
             )
-            rows = session.execute(stmt).all()
+            rows = conn.execute(stmt).fetchall()
         path_map = {row.id: (row.path, row.tier_path) for row in rows}
         data = [
             (
@@ -459,9 +457,8 @@ class Worker:
             raise error
 
     def _delete_db_row(self, path: str) -> None:
-        with self._get_session() as session:
-            session.execute(delete(FILES_TABLE).where(FILES_TABLE.c.path == path))
-            session.commit()
+        with self._engine.begin() as conn:
+            conn.execute(delete(FILES_TABLE).where(FILES_TABLE.c.path == path))
 
     def work_input(
         self, item: DataItem | DataItemMoveFile | DataItemDeleteFile

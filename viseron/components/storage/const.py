@@ -16,8 +16,8 @@ DATABASE_URL = os.getenv(
 ENGINE = create_engine(
     DATABASE_URL,
     connect_args={"options": "-c timezone=UTC"},
-    pool_size=10,
-    max_overflow=90,
+    pool_size=5,
+    max_overflow=5,
 )
 
 
