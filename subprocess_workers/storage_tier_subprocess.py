@@ -563,16 +563,22 @@ class Worker:
                     LOGGER.exception("malloc_trim failed")
 
     def move_file(self, item: DataItemMoveFile) -> None:
-        """Copy + unlink; falls back to DB cleanup if source is missing."""
+        """Copy + unlink; falls back to DB cleanup if source is missing.
+
+        FileNotFoundError on the source means the file is already gone
+        — in a cleanup/move context that is success, not a failure.
+        Drop the DB row so we don't try again, then return silently.
+        OSError is re-raised so genuine disk/NFS problems still surface.
+        """
         if "move_file" in self._skip:
             return
         try:
             os.makedirs(os.path.dirname(item.dst), exist_ok=True)
             shutil.copy(item.src, item.dst)
             os.remove(item.src)
-        except FileNotFoundError as error:
+        except FileNotFoundError:
             self._delete_db_row(item.src)
-            raise error
+            return
         except OSError as error:
             self._delete_db_row(item.src)
             try:
@@ -582,14 +588,19 @@ class Worker:
             raise error
 
     def delete_file(self, item: DataItemDeleteFile) -> None:
-        """Delete DB row and unlink the file."""
+        """Delete DB row and unlink the file.
+
+        FileNotFoundError is the success case for a cleanup job — our
+        goal was for the file not to exist. Don't raise; the caller
+        doesn't care why the file is gone, only that the DB row is.
+        """
         if "delete_file" in self._skip:
             return
         self._delete_db_row(item.src)
         try:
             os.remove(item.src)
-        except FileNotFoundError as error:
-            raise error
+        except FileNotFoundError:
+            return
 
     def _delete_db_row(self, path: str) -> None:
         with self._engine.begin() as conn:
