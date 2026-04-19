@@ -43,7 +43,6 @@ from sqlalchemy import (
     delete,
     select,
 )
-from sqlalchemy.pool import NullPool
 
 from manager import connect
 from subprocess_workers.storage_tier_compute import (
@@ -204,17 +203,13 @@ class Worker:
         database_url = os.getenv(
             "POSTGRES_DATABASE_URL", "postgresql://postgres@localhost/viseron"
         )
-        # NullPool: don't reuse connections. Each query opens a fresh
-        # psycopg2 connection and closes it on context-manager exit, so
-        # cursor C-buffers and libpq internal state are returned to the
-        # OS immediately instead of accumulating in pool-held objects
-        # (which tracemalloc can't see). With ~1-2 queries/sec at peak
-        # via a local unix socket, the per-connection handshake cost is
-        # negligible and pooling provides no benefit here.
         self._engine = create_engine(
             database_url,
             connect_args={"options": "-c timezone=UTC"},
-            poolclass=NullPool,
+            pool_size=1,
+            max_overflow=1,
+            pool_pre_ping=True,
+            pool_recycle=300,
         )
         self._trim = trim
         self._last_call: dict[str, float] = {}
@@ -470,6 +465,21 @@ class Worker:
         with self._engine.begin() as conn:
             conn.execute(delete(FILES_TABLE).where(FILES_TABLE.c.path == path))
 
+    def recycle_engine(self) -> None:
+        """Dispose the engine to force-release psycopg2 C-level buffers.
+
+        SQLAlchemy's pool_recycle replaces stale connections lazily on
+        checkout, but the previously-closed psycopg2 connections still
+        live in the pool's weakref registry until dispose(). The cursor
+        buffers freed by psycopg2 at close-time are also untraceable by
+        tracemalloc — only a full dispose reliably returns that memory
+        to the OS. Run this periodically to keep subprocess RSS bounded.
+        """
+        try:
+            self._engine.dispose()
+        except Exception:  # pylint: disable=broad-except
+            LOGGER.exception("engine.dispose failed")
+
     def work_input(
         self, item: DataItem | DataItemMoveFile | DataItemDeleteFile
     ) -> None:
@@ -582,6 +592,7 @@ def main() -> None:
         run_date=_utcnow() + datetime.timedelta(seconds=30),
     )
     scheduler.add_job(_log_memory_summary, "interval", minutes=10)
+    scheduler.add_job(worker.recycle_engine, "interval", minutes=15)
 
     check_queue: Queue[DataItem] = Queue()
     file_queue: Queue[DataItemDeleteFile | DataItemMoveFile] = Queue()
