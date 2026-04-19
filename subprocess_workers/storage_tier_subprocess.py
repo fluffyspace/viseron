@@ -67,6 +67,26 @@ CAMERA_SEGMENT_DURATION = 5
 
 ENV_PROFILE_MEMORY = "VISERON_PROFILE_MEMORY"
 
+# Comma-separated list of operations to skip, for memory-leak bisection.
+# Valid tokens: load_tier, load_recordings, compute, resolve_paths,
+# move_file, delete_file. Skipped operations return empty results or
+# noop; the surrounding machinery still runs so per-command timings
+# stay comparable. Do NOT leave enabled in production — skipping
+# move_file means files never move between tiers and disks will fill.
+ENV_STORAGE_SKIP = "VISERON_STORAGE_SKIP"
+
+
+def _skip_tokens() -> frozenset[str]:
+    raw = os.getenv(ENV_STORAGE_SKIP, "")
+    return frozenset(t.strip() for t in raw.split(",") if t.strip())
+
+
+# Module-global so _log_memory_summary can compute a diff against the
+# previous snapshot without touching Worker state. Cumulative tracemalloc
+# stats tell us the total pinned size; the diff tells us what's actively
+# growing, which is what we need for leak hunting.
+_LAST_SNAPSHOT: tracemalloc.Snapshot | None = None
+
 
 # SQLAlchemy Core Table definitions for the two tables this subprocess
 # reads/writes. Kept deliberately minimal: only the columns actually
@@ -127,28 +147,81 @@ def _load_malloc_trim() -> Callable[[], None] | None:
     return lambda: trim(0)
 
 
-def _log_memory_summary() -> None:
-    """Emit RSS and (if enabled) a tracemalloc top-N breakdown.
+def _log_memory_summary(worker: "Worker | None" = None) -> None:
+    """Emit RSS, per-command metrics, gc state, and tracemalloc diff.
 
     Written line-by-line because the main process's LogPipe splits on
     newlines and strips leading whitespace before picking a level — a
     single multi-line message would get mangled.
+
+    The per-command metrics and tracemalloc diff are reset on every
+    call, so each summary describes the activity since the previous
+    summary (typically a 10-minute window).
     """
+    global _LAST_SNAPSHOT  # pylint: disable=global-statement
     try:
-        rss_mib = psutil.Process().memory_info().rss / (1024 * 1024)
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        rss_mib = mem.rss / (1024 * 1024)
+        vms_mib = mem.vms / (1024 * 1024)
         LOGGER.info("storage subprocess memory summary")
-        LOGGER.info("  RSS: %.1f MiB", rss_mib)
+        LOGGER.info("  RSS: %.1f MiB  VMS: %.1f MiB", rss_mib, vms_mib)
+
+        if worker is not None:
+            metrics = worker.drain_metrics()
+            for cmd, m in metrics.items():
+                if m["count"] == 0:
+                    continue
+                avg_rss_mib = (m["rss_delta_sum"] / m["count"]) / (1024 * 1024)
+                max_rss_mib = m["rss_delta_max"] / (1024 * 1024)
+                total_rss_mib = m["rss_delta_sum"] / (1024 * 1024)
+                avg_ms = (m["duration_sum"] / m["count"]) * 1000
+                LOGGER.info(
+                    "  cmd=%-12s count=%-6d total_rss=%+.2f MiB "
+                    "avg_rss=%+.3f MiB max_rss=%+.2f MiB avg=%.1f ms",
+                    cmd,
+                    m["count"],
+                    total_rss_mib,
+                    avg_rss_mib,
+                    max_rss_mib,
+                    avg_ms,
+                )
+
+        gc_counts = gc.get_count()
+        gc_stats = gc.get_stats()
+        LOGGER.info(
+            "  gc alive=%s collections=%s",
+            gc_counts,
+            [s["collections"] for s in gc_stats],
+        )
+
         if tracemalloc.is_tracing():
             snap = tracemalloc.take_snapshot()
+
             stats = snap.statistics("filename")[:10]
+            LOGGER.info("  tracemalloc cumulative top 10:")
             for stat in stats:
                 fname = str(stat.traceback).split("/")[-1][:60]
                 LOGGER.info(
-                    "  %-60s %6.2f MiB (%d allocs)",
+                    "    %-60s %6.2f MiB (%d allocs)",
                     fname,
                     stat.size / (1024 * 1024),
                     stat.count,
                 )
+
+            if _LAST_SNAPSHOT is not None:
+                diff = snap.compare_to(_LAST_SNAPSHOT, "filename")[:10]
+                LOGGER.info("  tracemalloc growth since last summary:")
+                for stat in diff:
+                    fname = str(stat.traceback).split("/")[-1][:60]
+                    LOGGER.info(
+                        "    %-60s delta=%+7.2f MiB (%+d allocs) now=%.2f MiB",
+                        fname,
+                        stat.size_diff / (1024 * 1024),
+                        stat.count_diff,
+                        stat.size / (1024 * 1024),
+                    )
+            _LAST_SNAPSHOT = snap
     except Exception:  # pylint: disable=broad-except
         LOGGER.exception("failed to log memory summary")
 
@@ -215,8 +288,34 @@ class Worker:
         self._last_call: dict[str, float] = {}
         self._check_locks: dict[str, threading.Lock] = {}
         self._checks_in_progress: dict[str, bool] = {}
+        self._skip = _skip_tokens()
+        if self._skip:
+            LOGGER.warning("VISERON_STORAGE_SKIP active: %s", sorted(self._skip))
+        self._metrics_lock = threading.Lock()
+        self._metrics: dict[str, dict[str, float]] = {
+            cmd: self._empty_metrics()
+            for cmd in ("check_tier", "move_file", "delete_file")
+        }
+
+    @staticmethod
+    def _empty_metrics() -> dict[str, float]:
+        return {
+            "count": 0,
+            "rss_delta_sum": 0,
+            "rss_delta_max": 0,
+            "duration_sum": 0.0,
+        }
+
+    def drain_metrics(self) -> dict[str, dict[str, float]]:
+        """Return accumulated per-command metrics and reset counters."""
+        with self._metrics_lock:
+            drained = self._metrics
+            self._metrics = {cmd: self._empty_metrics() for cmd in drained}
+        return drained
 
     def _load_tier(self, item: DataItem) -> np.ndarray:
+        if "load_tier" in self._skip:
+            return np.empty(0, dtype=FILES_COMPUTE_DTYPE)
         with self._engine.connect() as conn:
             stmt = select(
                 FILES_TABLE.c.id, FILES_TABLE.c.size, FILES_TABLE.c.orig_ctime
@@ -231,9 +330,21 @@ class Worker:
                 (row.id, row.size, int(row.orig_ctime.timestamp()))
                 for row in rows
             ]
-        return np.array(data, dtype=FILES_COMPUTE_DTYPE)
+        arr = np.array(data, dtype=FILES_COMPUTE_DTYPE)
+        LOGGER.debug(
+            "_load_tier %s/tier%s/%s/%s: %d rows, %.2f MiB",
+            item.camera_identifier,
+            item.tier_id,
+            item.category,
+            ",".join(item.subcategories),
+            len(data),
+            arr.nbytes / (1024 * 1024),
+        )
+        return arr
 
     def _load_recordings(self, item: DataItem) -> np.ndarray:
+        if "load_recordings" in self._skip:
+            return np.empty(0, dtype=RECORDINGS_DTYPE)
         with self._engine.connect() as conn:
             stmt = select(
                 RECORDINGS_TABLE.c.id,
@@ -254,10 +365,19 @@ class Worker:
                 )
                 for row in rows
             ]
-        return np.array(data, dtype=RECORDINGS_DTYPE)
+        arr = np.array(data, dtype=RECORDINGS_DTYPE)
+        LOGGER.debug(
+            "_load_recordings %s: %d rows, %.2f MiB",
+            item.camera_identifier,
+            len(data),
+            arr.nbytes / (1024 * 1024),
+        )
+        return arr
 
     def _resolve_file_paths(self, file_ids: np.ndarray) -> np.ndarray:
         """Fetch paths for file IDs eligible to move."""
+        if "resolve_paths" in self._skip:
+            return np.empty(0, dtype=FILES_RESULT_DTYPE)
         ids_list = file_ids.tolist()
         with self._engine.connect() as conn:
             stmt = select(
@@ -274,6 +394,8 @@ class Worker:
 
     def _resolve_recording_file_paths(self, ids_to_move: np.ndarray) -> np.ndarray:
         """Fetch paths for recording-file pairs, filtering to .m4s only."""
+        if "resolve_paths" in self._skip:
+            return np.empty(0, dtype=RECORDINGS_RESULT_DTYPE)
         file_ids_list = list({int(x) for x in ids_to_move["id"]})
         with self._engine.connect() as conn:
             stmt = select(
@@ -300,6 +422,8 @@ class Worker:
 
     def _check_tier_files(self, item: DataItem) -> np.ndarray:
         data = self._load_tier(item)
+        if "compute" in self._skip:
+            return np.empty(0, dtype=FILES_RESULT_DTYPE)
         now = _utcnow()
 
         if item.min_age:
@@ -337,6 +461,8 @@ class Worker:
 
         files_data = self._load_tier(item)
         recordings_data = self._load_recordings(item)
+        if "compute" in self._skip:
+            return np.empty(0, dtype=RECORDINGS_RESULT_DTYPE)
         now = _utcnow()
 
         if item.events_min_age:
@@ -438,6 +564,8 @@ class Worker:
 
     def move_file(self, item: DataItemMoveFile) -> None:
         """Copy + unlink; falls back to DB cleanup if source is missing."""
+        if "move_file" in self._skip:
+            return
         try:
             os.makedirs(os.path.dirname(item.dst), exist_ok=True)
             shutil.copy(item.src, item.dst)
@@ -455,6 +583,8 @@ class Worker:
 
     def delete_file(self, item: DataItemDeleteFile) -> None:
         """Delete DB row and unlink the file."""
+        if "delete_file" in self._skip:
+            return
         self._delete_db_row(item.src)
         try:
             os.remove(item.src)
@@ -483,7 +613,15 @@ class Worker:
     def work_input(
         self, item: DataItem | DataItemMoveFile | DataItemDeleteFile
     ) -> None:
-        """Dispatch input item to the right handler."""
+        """Dispatch input item to the right handler.
+
+        Records RSS delta and wall-clock duration per command type so the
+        10-minute memory summary can pin growth to a specific operation.
+        """
+        cmd = getattr(item, "cmd", None)
+        process = psutil.Process()
+        rss_before = process.memory_info().rss
+        t0 = time.monotonic()
         try:
             if item.cmd == "check_tier":
                 self.check_tier(item)  # type: ignore[arg-type]
@@ -494,6 +632,16 @@ class Worker:
         except Exception as error:  # pylint: disable=broad-except
             LOGGER.error("Error processing command: %s, error: %s", item, error)
             item.error = str(error)
+        finally:
+            if cmd in self._metrics:
+                rss_delta = process.memory_info().rss - rss_before
+                duration = time.monotonic() - t0
+                with self._metrics_lock:
+                    m = self._metrics[cmd]
+                    m["count"] += 1
+                    m["rss_delta_sum"] += rss_delta
+                    m["rss_delta_max"] = max(m["rss_delta_max"], rss_delta)
+                    m["duration_sum"] += duration
 
 
 def worker_task_files(
@@ -590,8 +738,9 @@ def main() -> None:
         _log_memory_summary,
         "date",
         run_date=_utcnow() + datetime.timedelta(seconds=30),
+        args=[worker],
     )
-    scheduler.add_job(_log_memory_summary, "interval", minutes=10)
+    scheduler.add_job(_log_memory_summary, "interval", minutes=10, args=[worker])
     scheduler.add_job(worker.recycle_engine, "interval", minutes=15)
 
     check_queue: Queue[DataItem] = Queue()

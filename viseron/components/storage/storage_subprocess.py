@@ -13,6 +13,7 @@ and delete files. This module contains only the parent-side glue:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from subprocess_workers.storage_tier_messages import (
@@ -25,12 +26,11 @@ from viseron.helpers.subprocess_worker import SubProcessWorker
 from viseron.watchdog.subprocess_watchdog import RestartablePopen
 
 if TYPE_CHECKING:
-    import logging
     from collections.abc import Callable
 
     from viseron import Viseron
 
-    _LOGGER: logging.Logger
+LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "DataItem",
@@ -50,6 +50,10 @@ class TierCheckWorker(SubProcessWorker):
             str,
             "Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]",
         ] = {}
+        # Log callbacks dict size on power-of-2 growth so we can see if
+        # pending callbacks are leaking (subprocess not returning items,
+        # id() collisions, etc.) without spamming the log on each send.
+        self._next_callbacks_log_threshold = 16
         super().__init__(vis, f"{__name__}.tier_check_worker", qsize=0)
 
     def spawn_subprocess(self) -> RestartablePopen:
@@ -78,6 +82,16 @@ class TierCheckWorker(SubProcessWorker):
         if callback is not None:
             item.callback_id = str(id(callback))
             self._callbacks[item.callback_id] = callback
+            size = len(self._callbacks)
+            if size >= self._next_callbacks_log_threshold:
+                LOGGER.warning(
+                    "TierCheckWorker pending callbacks dict size: %d "
+                    "(latest cmd=%s cam=%s)",
+                    size,
+                    getattr(item, "cmd", None),
+                    getattr(item, "camera_identifier", None),
+                )
+                self._next_callbacks_log_threshold = size * 2
         self.input_queue.put(item)
 
     def work_output(
