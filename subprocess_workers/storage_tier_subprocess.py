@@ -272,6 +272,12 @@ def initializer(cpulimit: int | None) -> None:
 class Worker:
     """Execute tier-check and file-move commands using SQLAlchemy Core."""
 
+    # Once a tier path raises OSError, skip operations against it for
+    # this long so a brief NFS outage doesn't create a storm of failed
+    # moves/deletes. Next attempt after this window succeeds normally
+    # if the tier has recovered, or re-arms the breaker if still bad.
+    TIER_FAILURE_BACKOFF_SEC = 60
+
     def __init__(self, trim: Callable[[], None] | None = None) -> None:
         database_url = os.getenv(
             "POSTGRES_DATABASE_URL", "postgresql://postgres@localhost/viseron"
@@ -296,6 +302,37 @@ class Worker:
             cmd: self._empty_metrics()
             for cmd in ("check_tier", "move_file", "delete_file")
         }
+        self._tier_failure_times: dict[str, float] = {}
+        self._tier_failure_lock = threading.Lock()
+
+    @staticmethod
+    def _tier_root(path: str) -> str:
+        """Return the first path component, e.g. '/tier3_recordings'."""
+        parts = path.split("/", 2)
+        return "/" + parts[1] if len(parts) > 1 and parts[1] else path
+
+    def _tier_is_healthy(self, path: str) -> bool:
+        """False if this tier hit an OSError within the backoff window."""
+        root = self._tier_root(path)
+        with self._tier_failure_lock:
+            last_fail = self._tier_failure_times.get(root)
+            if last_fail is None:
+                return True
+            if time.time() - last_fail >= self.TIER_FAILURE_BACKOFF_SEC:
+                del self._tier_failure_times[root]
+                return True
+        return False
+
+    def _mark_tier_failed(self, path: str) -> None:
+        """Arm the circuit breaker for this path's tier."""
+        root = self._tier_root(path)
+        with self._tier_failure_lock:
+            first_failure = root not in self._tier_failure_times
+            self._tier_failure_times[root] = time.time()
+        if first_failure:
+            LOGGER.warning(
+                "tier %s marked unhealthy for %ds", root, self.TIER_FAILURE_BACKOFF_SEC
+            )
 
     @staticmethod
     def _empty_metrics() -> dict[str, float]:
@@ -563,14 +600,23 @@ class Worker:
                     LOGGER.exception("malloc_trim failed")
 
     def move_file(self, item: DataItemMoveFile) -> None:
-        """Copy + unlink; falls back to DB cleanup if source is missing.
+        """Copy src to dst, then unlink src.
 
-        FileNotFoundError on the source means the file is already gone
-        — in a cleanup/move context that is success, not a failure.
-        Drop the DB row so we don't try again, then return silently.
-        OSError is re-raised so genuine disk/NFS problems still surface.
+        Cases:
+        - Source already gone (FileNotFoundError): the move goal is
+          met, clean up the stale DB row and return silently.
+        - Destination tier recently unhealthy: skip silently; next
+          tier check will retry once the breaker window expires.
+        - Any other OSError: do NOT touch source or its DB row. The
+          previous behaviour (delete src + src's DB row) destroyed
+          data on transient NFS failures — if the copy partially
+          succeeded or the dst was briefly unreachable, we lost the
+          file. Non-destructive: arm the circuit breaker and re-raise
+          so work_input logs it, then next tier check retries.
         """
         if "move_file" in self._skip:
+            return
+        if not self._tier_is_healthy(item.dst):
             return
         try:
             os.makedirs(os.path.dirname(item.dst), exist_ok=True)
@@ -580,27 +626,29 @@ class Worker:
             self._delete_db_row(item.src)
             return
         except OSError as error:
-            self._delete_db_row(item.src)
-            try:
-                os.remove(item.src)
-            except FileNotFoundError:
-                pass
+            self._mark_tier_failed(item.dst)
             raise error
 
     def delete_file(self, item: DataItemDeleteFile) -> None:
         """Delete DB row and unlink the file.
 
         FileNotFoundError is the success case for a cleanup job — our
-        goal was for the file not to exist. Don't raise; the caller
-        doesn't care why the file is gone, only that the DB row is.
+        goal was for the file not to exist. On any other OSError, arm
+        the circuit breaker and re-raise so the retry happens next
+        tier check.
         """
         if "delete_file" in self._skip:
+            return
+        if not self._tier_is_healthy(item.src):
             return
         self._delete_db_row(item.src)
         try:
             os.remove(item.src)
         except FileNotFoundError:
             return
+        except OSError as error:
+            self._mark_tier_failed(item.src)
+            raise error
 
     def _delete_db_row(self, path: str) -> None:
         with self._engine.begin() as conn:

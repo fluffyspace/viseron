@@ -14,6 +14,7 @@ and delete files. This module contains only the parent-side glue:
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 from subprocess_workers.storage_tier_messages import (
@@ -32,6 +33,14 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+# Cap on pending callbacks. When the subprocess drops or loses items
+# (observed: inotify-over-NFS glitches, subprocess restarts mid-work,
+# circuit-breaker silent skips), callbacks never get popped. Without
+# a cap the parent's _callbacks dict grew to 131k entries in one
+# observation window. Oldest entries are evicted FIFO — losing them
+# just means a future subprocess reply becomes a no-op pop.
+MAX_PENDING_CALLBACKS = 10_000
+
 __all__ = [
     "DataItem",
     "DataItemDeleteFile",
@@ -46,10 +55,11 @@ class TierCheckWorker(SubProcessWorker):
     def __init__(self, vis: "Viseron", cpulimit: int | None, workers: int) -> None:
         self._cpulimit = cpulimit
         self._workers = workers
-        self._callbacks: dict[
+        # OrderedDict so we can FIFO-evict old entries if the cap is hit.
+        self._callbacks: OrderedDict[
             str,
             "Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]",
-        ] = {}
+        ] = OrderedDict()
         # Log callbacks dict size on power-of-2 growth so we can see if
         # pending callbacks are leaking (subprocess not returning items,
         # id() collisions, etc.) without spamming the log on each send.
@@ -82,6 +92,11 @@ class TierCheckWorker(SubProcessWorker):
         if callback is not None:
             item.callback_id = str(id(callback))
             self._callbacks[item.callback_id] = callback
+            if len(self._callbacks) > MAX_PENDING_CALLBACKS:
+                evicted, _ = self._callbacks.popitem(last=False)
+                LOGGER.debug(
+                    "TierCheckWorker _callbacks cap hit, evicted oldest %s", evicted
+                )
             size = len(self._callbacks)
             if size >= self._next_callbacks_log_threshold:
                 LOGGER.warning(

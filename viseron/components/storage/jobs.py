@@ -288,7 +288,15 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
         return CleanupJobNames.ORPHANED_DB_FILES.value
 
     def _run(self) -> None:
-        """Run the job."""
+        """Run the job.
+
+        Uses a fresh short-lived session per batch and performs the
+        filesystem existence checks with NO session held. The previous
+        implementation held one session open across the entire walk,
+        which on an NFS-backed tier could block in ``os.path.exists``
+        for many minutes while pinning a postgres transaction — we
+        observed connections stuck "idle in transaction" for 5+ hours.
+        """
         now = time.time()
         LOGGER.debug("Running %s", self.name)
         total_deleted = 0
@@ -302,12 +310,13 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                 ).select_from(Files)
             ).scalar()
 
-            while True:
-                if self.kill_event.is_set():
-                    break
+        while True:
+            if self.kill_event.is_set():
+                break
 
-                # Get next batch of files to check
-                time.sleep(1)
+            time.sleep(1)
+
+            with self._storage.get_session() as session:
                 files = session.execute(
                     select(Files.id, Files.path)
                     .where(Files.id > last_id)
@@ -315,20 +324,19 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                     .limit(BATCH_SIZE)
                 ).all()
 
-                if not files:
-                    break
+            if not files:
+                break
 
-                # Update cursor
-                last_id = files[-1][0]
+            last_id = files[-1][0]
 
-                # Find records where files don't exist
-                to_delete = [
-                    file_id
-                    for file_id, file_path in files
-                    if not os.path.exists(file_path)
-                ]
+            to_delete = [
+                file_id
+                for file_id, file_path in files
+                if not os.path.exists(file_path)
+            ]
 
-                if to_delete:
+            if to_delete:
+                with self._storage.get_session() as session:
                     result = session.execute(
                         delete(Files).where(Files.id.in_(to_delete))
                     )
@@ -337,10 +345,10 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                     LOGGER.debug(
                         "%s deleted %d rows in batch", self.name, result.rowcount
                     )
-                total_files_processed += len(files)
-                self.log_progress(
-                    f"{self.name} processed {total_files_processed}/{count} files"
-                )
+            total_files_processed += len(files)
+            self.log_progress(
+                f"{self.name} processed {total_files_processed}/{count} files"
+            )
 
         LOGGER.debug(
             "%s deleted %d total database records for non-existent files, took %s",
