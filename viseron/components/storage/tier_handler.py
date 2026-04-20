@@ -102,6 +102,16 @@ if TYPE_CHECKING:
     from viseron.domains.camera import AbstractCamera
 
 
+def _path_root(path: str) -> str:
+    """Return the first path component (e.g. '/tier3_recordings').
+
+    Must match Worker._tier_root in storage_tier_subprocess.py — the
+    subprocess's circuit-breaker state is keyed by this same root.
+    """
+    parts = path.split("/", 2)
+    return "/" + parts[1] if len(parts) > 1 and parts[1] else path
+
+
 class TierHandler(FileSystemEventHandler):
     """Moves files up configured tiers."""
 
@@ -228,6 +238,9 @@ class TierHandler(FileSystemEventHandler):
         self,
     ) -> DataItem:
         """Create a DataItem for the check tier command."""
+        next_tier_root: str | None = None
+        if self._next_tier is not None:
+            next_tier_root = _path_root(self._next_tier[CONFIG_PATH])
         return DataItem(
             cmd="check_tier",
             camera_identifier=self._camera.identifier,
@@ -240,6 +253,7 @@ class TierHandler(FileSystemEventHandler):
             max_age=self._max_age,
             min_bytes=self._min_bytes,
             drain=self._tier[CONFIG_DRAIN],
+            next_tier_root=next_tier_root,
         )
 
     def _check_tier_event_handler(self, _event: Event) -> None:
@@ -1099,6 +1113,14 @@ def move_file(
     def _move_file_callback(
         item: DataItemMoveFile,
     ) -> None:
+        if item.skipped:
+            # Subprocess circuit-breaker skipped the copy, so the dst
+            # file will never appear and the watchdog FileCreatedEvent
+            # on dst (which normally pops temporary_files_meta) will
+            # never fire. Pop it ourselves — otherwise every breaker
+            # cycle accumulates entries here for the whole 60 s window.
+            storage.temporary_files_meta.pop(dst, None)
+            return
         if item.error:
             logger.error(f"Error moving file {src} to {dst}: {item.error}")
             vis.dispatch_event(

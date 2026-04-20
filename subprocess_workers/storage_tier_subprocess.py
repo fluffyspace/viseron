@@ -571,6 +571,16 @@ class Worker:
         if item.camera_identifier not in self._checks_in_progress:
             self._checks_in_progress[item.camera_identifier] = False
 
+        # If the tier we'd move files INTO is circuit-broken, there is
+        # no point doing the DB load + numpy compute + path resolution:
+        # every resulting move_file would be silently dropped by the
+        # breaker in move_file(), and each one would have to be
+        # rolled back on the parent side. Signal an empty result so
+        # on_check_tier_result early-returns.
+        if item.next_tier_root and not self._tier_is_healthy(item.next_tier_root):
+            item.data = None
+            return
+
         with self._check_locks[item.camera_identifier]:
             if self._checks_in_progress[item.camera_identifier]:
                 return
@@ -617,6 +627,7 @@ class Worker:
         if "move_file" in self._skip:
             return
         if not self._tier_is_healthy(item.dst):
+            item.skipped = True
             return
         try:
             os.makedirs(os.path.dirname(item.dst), exist_ok=True)
@@ -640,6 +651,7 @@ class Worker:
         if "delete_file" in self._skip:
             return
         if not self._tier_is_healthy(item.src):
+            item.skipped = True
             return
         self._delete_db_row(item.src)
         try:

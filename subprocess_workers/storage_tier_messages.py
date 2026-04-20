@@ -39,6 +39,12 @@ class DataItem:
     events_min_age: datetime.timedelta | None = None
     events_max_age: datetime.timedelta | None = None
     events_min_bytes: int | None = None
+    # First path component of the tier files would move INTO (e.g.
+    # "/tier3_recordings"). Lets the subprocess short-circuit a
+    # check_tier whose destination tier is circuit-broken — otherwise
+    # we do the full DB+numpy work only to have every resulting
+    # move_file silently dropped. None = don't short-circuit.
+    next_tier_root: str | None = None
     callback_id: str | None = None
     data: "np.ndarray | None" = None
     error: str | None = None
@@ -62,6 +68,12 @@ class DataItemMoveFile:
     dst: str
     callback_id: str | None = None
     error: str | None = None
+    # True when the subprocess circuit-broke this op instead of
+    # attempting it. The caller must treat this distinctly from a
+    # plain success — in particular, any state staged before the
+    # send (e.g. temporary_files_meta) must be rolled back, since
+    # no filesystem event will arrive to clean it up.
+    skipped: bool = False
 
 
 @dataclass
@@ -72,3 +84,4 @@ class DataItemDeleteFile:
     src: str
     callback_id: str | None = None
     error: str | None = None
+    skipped: bool = False
