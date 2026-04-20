@@ -234,6 +234,17 @@ class TierHandler(FileSystemEventHandler):
         self._max_age = calculate_age(self._tier[CONFIG_MAX_AGE])
         self._min_age = calculate_age(self._tier[CONFIG_MIN_AGE])
 
+        if (
+            self._next_tier is None
+            and not self._max_age
+            and not self._max_bytes
+        ):
+            self._logger.warning(
+                "Last tier '%s' has no max_age or max_size configured; "
+                "files on this tier will accumulate indefinitely.",
+                self._tier[CONFIG_PATH],
+            )
+
     def _create_dataitem(
         self,
     ) -> DataItem:
@@ -551,6 +562,18 @@ class SegmentsTierHandler(TierHandler):
             any(self._continuous_params)
             and self._camera.config[CONFIG_RECORDER][CONFIG_CONTINUOUS_RECORDING]
         )
+
+        if (
+            self._next_tier is None
+            and not any(self._events_params)
+            and not any(self._continuous_params)
+        ):
+            self._logger.warning(
+                "Last recorder tier '%s' has no retention (max_age/max_size) "
+                "configured for events or continuous; files on this tier will "
+                "accumulate indefinitely.",
+                self._path,
+            )
 
         self.add_file_handler(self._path, rf"{self._path}/(.*.m4s$)")
         self.add_file_handler(self._path, rf"{self._path}/(.*.mp4$)")
