@@ -209,6 +209,20 @@ def _log_memory_summary(worker: "Worker | None" = None) -> None:
                     stat.count,
                 )
 
+            # Top 5 by full traceback so we can disambiguate which
+            # "connection.py" is leaking (multiprocessing / psycopg2 /
+            # sqlalchemy) and pin the actual call site.
+            tb_stats = snap.statistics("traceback")[:5]
+            LOGGER.info("  tracemalloc cumulative top 5 by traceback:")
+            for stat in tb_stats:
+                LOGGER.info(
+                    "    %6.2f MiB (%d allocs)",
+                    stat.size / (1024 * 1024),
+                    stat.count,
+                )
+                for frame in stat.traceback.format():
+                    LOGGER.info("      %s", frame)
+
             if _LAST_SNAPSHOT is not None:
                 diff = snap.compare_to(_LAST_SNAPSHOT, "filename")[:10]
                 LOGGER.info("  tracemalloc growth since last summary:")
@@ -787,7 +801,11 @@ def main() -> None:
     setup_logger(args.loglevel)
 
     if os.getenv(ENV_PROFILE_MEMORY) == "true" and not tracemalloc.is_tracing():
-        tracemalloc.start()
+        # 10 frames so _log_memory_summary's traceback view shows the call
+        # site of the leak, not just the filename. Diagnostic — drop back
+        # to default once the leak source (multiprocessing vs psycopg2 vs
+        # sqlalchemy "connection.py") is identified.
+        tracemalloc.start(10)
 
     process_queue, output_queue = connect(
         "127.0.0.1", int(args.manager_port), args.manager_authkey
