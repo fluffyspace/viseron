@@ -1036,6 +1036,7 @@ def handle_file(
         logger.debug("File %s is recently requested, skipping", path)
         return
 
+    stuck_row = False
     if force_delete or next_tier is None:
         delete_file(
             storage,
@@ -1050,6 +1051,7 @@ def handle_file(
                 "changed the tier paths or a previous move failed.",
                 path,
             )
+            stuck_row = True
         else:
             move_file(
                 vis,
@@ -1064,17 +1066,24 @@ def handle_file(
                 logger,
             )
 
-    # Delete the file from the database if tier_path is not the same as
-    # curr_tier[CONFIG_PATH]. This is an indication that the tier configuration
-    # has changed and since the old path is not monitored, the delete signal
-    # will not be received by Viseron
-    if tier_path != curr_tier[CONFIG_PATH]:
+    # Delete the file from the database if:
+    # - tier_path is not the same as curr_tier[CONFIG_PATH]. This is an
+    #   indication that the tier configuration has changed and since the old
+    #   path is not monitored, the delete signal will not be received by
+    #   Viseron.
+    # - the move target equals the source (stuck_row). The row points at a
+    #   path this handler can never move or delete, so each tier-check pass
+    #   would re-process it and slowly leak SQLAlchemy connection objects in
+    #   the storage subprocess. Drop the row; OrphanedFilesCleanup will sweep
+    #   the on-disk file if it still exists.
+    if stuck_row or tier_path != curr_tier[CONFIG_PATH]:
         logger.debug(
             "Deleting file %s from database since tier paths are different. "
-            "file tier_path: %s, current tier_path: %s",
+            "file tier_path: %s, current tier_path: %s, stuck_row: %s",
             path,
             tier_path,
             curr_tier[CONFIG_PATH],
+            stuck_row,
         )
         with get_session() as session:
             stmt = delete(Files).where(Files.path == path)
