@@ -14,6 +14,7 @@ and delete files. This module contains only the parent-side glue:
 from __future__ import annotations
 
 import logging
+import os
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
@@ -68,6 +69,18 @@ class TierCheckWorker(SubProcessWorker):
 
     def spawn_subprocess(self) -> RestartablePopen:
         """Spawn the standalone subprocess entry script."""
+        # MALLOC_ARENA_MAX=2 caps glibc's per-thread heap arenas. The
+        # subprocess runs ~6 long-lived worker threads (dispatcher +
+        # mixed_workers + file_worker) plus apscheduler executors. With
+        # the default arena count (CPU*8), each thread gets its own arena
+        # and pages freed by Python stay pinned in whichever arena freed
+        # them. On Kodba this produced a 3+ GiB plateau RSS while
+        # tracemalloc showed near-zero Python-tracked allocations —
+        # textbook glibc fragmentation. Capping arenas forces freed
+        # pages into a small shared pool that malloc_trim can return to
+        # the OS. Set on the subprocess only — the main viseron process
+        # benefits from more arenas for its FFmpeg/OpenCV worker threads.
+        env = {**os.environ, "MALLOC_ARENA_MAX": "2"}
         return RestartablePopen(
             (
                 "python3 -u subprocess_workers/storage_tier_subprocess.py "
@@ -80,6 +93,7 @@ class TierCheckWorker(SubProcessWorker):
             name=self.subprocess_name,
             stdout=self._log_pipe,
             stderr=self._log_pipe,
+            env=env,
         )
 
     def send_command(

@@ -801,11 +801,7 @@ def main() -> None:
     setup_logger(args.loglevel)
 
     if os.getenv(ENV_PROFILE_MEMORY) == "true" and not tracemalloc.is_tracing():
-        # 10 frames so _log_memory_summary's traceback view shows the call
-        # site of the leak, not just the filename. Diagnostic — drop back
-        # to default once the leak source (multiprocessing vs psycopg2 vs
-        # sqlalchemy "connection.py") is identified.
-        tracemalloc.start(10)
+        tracemalloc.start()
 
     process_queue, output_queue = connect(
         "127.0.0.1", int(args.manager_port), args.manager_authkey
@@ -831,6 +827,15 @@ def main() -> None:
     )
     scheduler.add_job(_log_memory_summary, "interval", minutes=10, args=[worker])
     scheduler.add_job(worker.recycle_engine, "interval", minutes=15)
+    # Periodic malloc_trim independent of check_tier. The per-check trim
+    # in Worker.check_tier only fires when a tier check completes (every
+    # few minutes per camera), but the heavy churn between checks is
+    # move_file / delete_file. Without a periodic trim, glibc holds
+    # freed pages from those bursts in its arenas and RSS plateaus
+    # several GiB above actual working set. Run every 60s — cheap
+    # (microseconds when arenas are clean) and keeps RSS bounded.
+    if trim is not None:
+        scheduler.add_job(trim, "interval", seconds=60)
 
     check_queue: Queue[DataItem] = Queue()
     file_queue: Queue[DataItemDeleteFile | DataItemMoveFile] = Queue()
