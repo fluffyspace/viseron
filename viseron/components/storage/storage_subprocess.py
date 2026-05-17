@@ -13,6 +13,7 @@ and delete files. This module contains only the parent-side glue:
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from collections import OrderedDict
@@ -61,9 +62,17 @@ class TierCheckWorker(SubProcessWorker):
             str,
             "Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]",
         ] = OrderedDict()
+        # Monotonic callback IDs. Previously str(id(callback)) — bound
+        # methods like self.on_check_tier_result are created lazily at
+        # attribute access; CPython is free to reuse the address once a
+        # previous bound method is freed, so two handlers' callbacks
+        # could collide at id() registration and route the wrong
+        # response to the wrong handler. itertools.count's next() is
+        # atomic under the GIL, so no extra lock needed.
+        self._next_callback_id = itertools.count(1)
         # Log callbacks dict size on power-of-2 growth so we can see if
-        # pending callbacks are leaking (subprocess not returning items,
-        # id() collisions, etc.) without spamming the log on each send.
+        # pending callbacks are leaking (subprocess not returning items)
+        # without spamming the log on each send.
         self._next_callbacks_log_threshold = 16
         super().__init__(vis, f"{__name__}.tier_check_worker", qsize=0)
 
@@ -104,7 +113,7 @@ class TierCheckWorker(SubProcessWorker):
     ) -> None:
         """Forward a job to the subprocess, remembering its callback."""
         if callback is not None:
-            item.callback_id = str(id(callback))
+            item.callback_id = str(next(self._next_callback_id))
             self._callbacks[item.callback_id] = callback
             if len(self._callbacks) > MAX_PENDING_CALLBACKS:
                 evicted, _ = self._callbacks.popitem(last=False)
