@@ -65,6 +65,14 @@ LOGGER = logging.getLogger(__name__)
 # imported) so this subprocess never touches the viseron package.
 CAMERA_SEGMENT_DURATION = 5
 
+# Server-side cursor fetch size for the DB loaders. Each loader streams
+# its result set in partitions of this many rows and packs one small
+# numpy array per partition, so the peak transient Python-object count
+# is bounded to a single chunk instead of the full per-camera result
+# set (~220K rows). Live data is tiny; the churn was the intermediate
+# Row/tuple representation, which fragmented the glibc heap.
+CHUNK = 10_000
+
 ENV_PROFILE_MEMORY = "VISERON_PROFILE_MEMORY"
 
 # Comma-separated list of operations to skip, for memory-leak bisection.
@@ -367,6 +375,13 @@ class Worker:
     def _load_tier(self, item: DataItem) -> np.ndarray:
         if "load_tier" in self._skip:
             return np.empty(0, dtype=FILES_COMPUTE_DTYPE)
+        # Stream the result server-side and pack each bounded chunk into
+        # its own small numpy array. Peak transient Python objects is
+        # one CHUNK of Row tuples instead of the full per-camera result
+        # set (~220K rows). Only stream while the connection is open;
+        # the connection is released before the heavy numpy/compute work.
+        chunks: list[np.ndarray] = []
+        total_rows = 0
         with self._engine.connect() as conn:
             stmt = select(
                 FILES_TABLE.c.id, FILES_TABLE.c.size, FILES_TABLE.c.orig_ctime
@@ -376,19 +391,28 @@ class Worker:
                 FILES_TABLE.c.category == item.category,
                 FILES_TABLE.c.subcategory.in_(item.subcategories),
             )
-            rows = conn.execute(stmt).fetchall()
-            data = [
-                (row.id, row.size, int(row.orig_ctime.timestamp()))
-                for row in rows
-            ]
-        arr = np.array(data, dtype=FILES_COMPUTE_DTYPE)
+            result = conn.execution_options(stream_results=True).execute(stmt)
+            for partition in result.partitions(CHUNK):
+                packed = np.array(
+                    [
+                        (row.id, row.size, int(row.orig_ctime.timestamp()))
+                        for row in partition
+                    ],
+                    dtype=FILES_COMPUTE_DTYPE,
+                )
+                chunks.append(packed)
+                total_rows += len(partition)
+        if chunks:
+            arr = np.concatenate(chunks)
+        else:
+            arr = np.empty(0, dtype=FILES_COMPUTE_DTYPE)
         LOGGER.debug(
             "_load_tier %s/tier%s/%s/%s: %d rows, %.2f MiB",
             item.camera_identifier,
             item.tier_id,
             item.category,
             ",".join(item.subcategories),
-            len(data),
+            total_rows,
             arr.nbytes / (1024 * 1024),
         )
         return arr
@@ -396,6 +420,8 @@ class Worker:
     def _load_recordings(self, item: DataItem) -> np.ndarray:
         if "load_recordings" in self._skip:
             return np.empty(0, dtype=RECORDINGS_DTYPE)
+        chunks: list[np.ndarray] = []
+        total_rows = 0
         with self._engine.connect() as conn:
             stmt = select(
                 RECORDINGS_TABLE.c.id,
@@ -404,23 +430,36 @@ class Worker:
                 RECORDINGS_TABLE.c.adjusted_start_time,
                 RECORDINGS_TABLE.c.created_at,
             ).where(RECORDINGS_TABLE.c.camera_identifier == item.camera_identifier)
-            rows = conn.execute(stmt).fetchall()
             now_ts = _utcnow().timestamp()
-            data = [
-                (
-                    row.id,
-                    int(row.start_time.timestamp()),
-                    int(row.adjusted_start_time.timestamp()),
-                    int(row.end_time.timestamp() if row.end_time else now_ts),
-                    int(row.created_at.timestamp()),
+            result = conn.execution_options(stream_results=True).execute(stmt)
+            for partition in result.partitions(CHUNK):
+                packed = np.array(
+                    [
+                        (
+                            row.id,
+                            int(row.start_time.timestamp()),
+                            int(row.adjusted_start_time.timestamp()),
+                            int(
+                                row.end_time.timestamp()
+                                if row.end_time
+                                else now_ts
+                            ),
+                            int(row.created_at.timestamp()),
+                        )
+                        for row in partition
+                    ],
+                    dtype=RECORDINGS_DTYPE,
                 )
-                for row in rows
-            ]
-        arr = np.array(data, dtype=RECORDINGS_DTYPE)
+                chunks.append(packed)
+                total_rows += len(partition)
+        if chunks:
+            arr = np.concatenate(chunks)
+        else:
+            arr = np.empty(0, dtype=RECORDINGS_DTYPE)
         LOGGER.debug(
             "_load_recordings %s: %d rows, %.2f MiB",
             item.camera_identifier,
-            len(data),
+            total_rows,
             arr.nbytes / (1024 * 1024),
         )
         return arr
@@ -430,12 +469,19 @@ class Worker:
         if "resolve_paths" in self._skip:
             return np.empty(0, dtype=FILES_RESULT_DTYPE)
         ids_list = file_ids.tolist()
+        # Stream the path rows in bounded chunks into path_map; peak
+        # transient Row objects is one CHUNK rather than the whole
+        # result set. The connection is released before the final
+        # numpy packing.
+        path_map: dict[Any, tuple] = {}
         with self._engine.connect() as conn:
             stmt = select(
                 FILES_TABLE.c.id, FILES_TABLE.c.path, FILES_TABLE.c.tier_path
             ).where(FILES_TABLE.c.id.in_(ids_list))
-            rows = conn.execute(stmt).fetchall()
-        path_map = {row.id: (row.path, row.tier_path) for row in rows}
+            result = conn.execution_options(stream_results=True).execute(stmt)
+            for partition in result.partitions(CHUNK):
+                for row in partition:
+                    path_map[row.id] = (row.path, row.tier_path)
         data = [
             (fid, path_map[fid][0], path_map[fid][1])
             for fid in ids_list
@@ -448,6 +494,7 @@ class Worker:
         if "resolve_paths" in self._skip:
             return np.empty(0, dtype=RECORDINGS_RESULT_DTYPE)
         file_ids_list = list({int(x) for x in ids_to_move["id"]})
+        path_map: dict[Any, tuple] = {}
         with self._engine.connect() as conn:
             stmt = select(
                 FILES_TABLE.c.id, FILES_TABLE.c.path, FILES_TABLE.c.tier_path
@@ -455,8 +502,10 @@ class Worker:
                 FILES_TABLE.c.id.in_(file_ids_list),
                 FILES_TABLE.c.path.like("%.m4s"),
             )
-            rows = conn.execute(stmt).fetchall()
-        path_map = {row.id: (row.path, row.tier_path) for row in rows}
+            result = conn.execution_options(stream_results=True).execute(stmt)
+            for partition in result.partitions(CHUNK):
+                for row in partition:
+                    path_map[row.id] = (row.path, row.tier_path)
         data = [
             (
                 int(rec["recording_id"]),
