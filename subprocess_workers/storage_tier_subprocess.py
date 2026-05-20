@@ -83,10 +83,89 @@ ENV_PROFILE_MEMORY = "VISERON_PROFILE_MEMORY"
 # move_file means files never move between tiers and disks will fill.
 ENV_STORAGE_SKIP = "VISERON_STORAGE_SKIP"
 
-
 def _skip_tokens() -> frozenset[str]:
     raw = os.getenv(ENV_STORAGE_SKIP, "")
     return frozenset(t.strip() for t in raw.split(",") if t.strip())
+
+
+# Previous gc.get_objects() type histogram, keyed by type name. Set by
+# _log_memory_summary so each summary can log the deltas (which classes
+# are growing). Module-global so it survives Worker recreation in tests.
+_LAST_GC_HISTOGRAM: dict[str, int] = {}
+
+
+def _read_smaps_rollup() -> dict[str, int] | None:
+    """Parse /proc/self/smaps_rollup into a {key_kib: value_bytes} dict.
+
+    Returns None on Linux versions without smaps_rollup (kernel <4.14)
+    or non-Linux. The interesting keys are: Rss, Pss, Anonymous (heap +
+    private anon mmap), Private_Clean / Private_Dirty (the part that
+    only this PID would lose if killed), Swap.
+    """
+    try:
+        with open("/proc/self/smaps_rollup", encoding="ascii") as f:
+            text = f.read()
+    except OSError:
+        return None
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        # Lines look like: "Rss:               12345 kB"
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].endswith(":") and parts[2] == "kB":
+            try:
+                out[parts[0][:-1]] = int(parts[1]) * 1024
+            except ValueError:
+                continue
+    return out or None
+
+
+class _MallInfo2(ctypes.Structure):
+    """Mirror of glibc's `struct mallinfo2` (glibc >= 2.33).
+
+    All fields are size_t. The two we read closest are uordblks (live
+    non-mmapped bytes, i.e. what malloc thinks is in use) and fordblks
+    (free bytes still pinned in the arena — the fragmentation signal).
+    arena = uordblks + fordblks. keepcost = top releasable contiguous
+    bytes (what malloc_trim(0) would actually return to the kernel).
+    """
+
+    _fields_ = [
+        ("arena", ctypes.c_size_t),
+        ("ordblks", ctypes.c_size_t),
+        ("smblks", ctypes.c_size_t),
+        ("hblks", ctypes.c_size_t),
+        ("hblkhd", ctypes.c_size_t),
+        ("usmblks", ctypes.c_size_t),
+        ("fsmblks", ctypes.c_size_t),
+        ("uordblks", ctypes.c_size_t),
+        ("fordblks", ctypes.c_size_t),
+        ("keepcost", ctypes.c_size_t),
+    ]
+
+
+def _load_mallinfo2() -> Callable[[], _MallInfo2] | None:
+    """Resolve glibc's mallinfo2() for fragmentation diagnostics.
+
+    mallinfo() (without the 2) is deprecated and overflows on 64-bit
+    because its fields are `int`. mallinfo2 uses `size_t` and has been
+    available since glibc 2.33 (Ubuntu 22.04 / Debian 12 are fine).
+    """
+    libc_name = ctypes.util.find_library("c")
+    if libc_name is None:
+        return None
+    try:
+        libc = ctypes.CDLL(libc_name)
+    except OSError:
+        return None
+    fn = getattr(libc, "mallinfo2", None)
+    if fn is None:
+        return None
+    fn.argtypes = []
+    fn.restype = _MallInfo2
+    return fn
+
+
+_MALLINFO2 = _load_mallinfo2()
 
 
 # Module-global so _log_memory_summary can compute a diff against the
@@ -155,6 +234,58 @@ def _load_malloc_trim() -> Callable[[], None] | None:
     return lambda: trim(0)
 
 
+def _log_deep_memory_probes() -> None:
+    """Walk the Python heap to answer 'is anything growing?' authoritatively.
+
+    Logs:
+      * total live object count (gc.get_objects())
+      * top 20 types by instance count
+      * delta vs previous summary for the top growers — this is the
+        line to read if RSS climbs over hours: a class growing
+        monotonically across summaries IS the retention leak.
+
+    Cost: ~50-150 ms on a healthy subprocess (one full Python heap
+    iteration). Runs in the scheduler thread, never blocks workers.
+    """
+    from collections import Counter  # pylint: disable=import-outside-toplevel
+
+    global _LAST_GC_HISTOGRAM  # pylint: disable=global-statement
+
+    objs = gc.get_objects()
+    n_total = len(objs)
+    hist = Counter(type(o).__name__ for o in objs)
+    # Release the giant list ASAP so we don't pin the heap snapshot.
+    del objs
+
+    top = hist.most_common(20)
+    LOGGER.info("  gc objects total=%d top types:", n_total)
+    for name, count in top:
+        prev = _LAST_GC_HISTOGRAM.get(name, 0)
+        delta = count - prev
+        LOGGER.info("    %-40s n=%-8d delta=%+d", name, count, delta)
+
+    # Also surface the biggest growers across ALL types, not just the
+    # top-20-by-count. A retention leak might be a low-count but
+    # always-growing custom class.
+    if _LAST_GC_HISTOGRAM:
+        all_keys = set(hist) | set(_LAST_GC_HISTOGRAM)
+        deltas = sorted(
+            ((k, hist.get(k, 0) - _LAST_GC_HISTOGRAM.get(k, 0)) for k in all_keys),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        positive = [(k, d) for k, d in deltas if d > 0][:10]
+        if positive:
+            LOGGER.info("  gc top 10 growers since last summary:")
+            for name, delta in positive:
+                LOGGER.info(
+                    "    %-40s delta=%+-8d now=%d",
+                    name, delta, hist.get(name, 0),
+                )
+
+    _LAST_GC_HISTOGRAM = dict(hist)
+
+
 def _log_memory_summary(worker: "Worker | None" = None) -> None:
     """Emit RSS, per-command metrics, gc state, and tracemalloc diff.
 
@@ -195,13 +326,116 @@ def _log_memory_summary(worker: "Worker | None" = None) -> None:
                     avg_ms,
                 )
 
-        gc_counts = gc.get_count()
+        # gc.get_count() is the per-generation allocation counter
+        # since the last collection of that generation — NOT live
+        # object counts. The earlier "alive=..." label here was
+        # misleading and led to a multi-day misdiagnosis ("only a
+        # few hundred live objects, must be fragmentation"). Renamed
+        # to "thresholds" to be honest.
+        gc_thresholds = gc.get_count()
         gc_stats = gc.get_stats()
         LOGGER.info(
-            "  gc alive=%s collections=%s",
-            gc_counts,
+            "  gc thresholds=%s collections=%s",
+            gc_thresholds,
             [s["collections"] for s in gc_stats],
         )
+
+        # Authoritative anon-vs-file-backed split of RSS. If 'Rss' here
+        # is much smaller than psutil's RSS, the extra came from a
+        # shared mapping (libs, files) and is not a leak we can fix.
+        # If Rss == Pss == Anonymous, the memory is entirely private
+        # heap that *would* be returned if this process exited.
+        smaps = _read_smaps_rollup()
+        if smaps is not None:
+            rss = smaps.get("Rss", 0) / (1024 * 1024)
+            pss = smaps.get("Pss", 0) / (1024 * 1024)
+            anon = smaps.get("Anonymous", 0) / (1024 * 1024)
+            pdirty = smaps.get("Private_Dirty", 0) / (1024 * 1024)
+            pclean = smaps.get("Private_Clean", 0) / (1024 * 1024)
+            swap = smaps.get("Swap", 0) / (1024 * 1024)
+            LOGGER.info(
+                "  smaps Rss=%.1f Pss=%.1f Anon=%.1f "
+                "PrivDirty=%.1f PrivClean=%.1f Swap=%.1f MiB",
+                rss, pss, anon, pdirty, pclean, swap,
+            )
+
+        # mallinfo2 — directly answer the fragmentation question.
+        #   arena    = total heap from sbrk/mmap (non-mmap chunks)
+        #   uordblks = bytes currently in use (live malloc'd)
+        #   fordblks = bytes free but pinned in arena (fragmentation)
+        #   hblkhd   = bytes in mmap'd chunks (large allocs, numpy)
+        #   keepcost = top releasable bytes (malloc_trim ceiling)
+        # If uordblks >> tracemalloc Python total -> C-extension leak.
+        # If fordblks is huge & keepcost tiny -> classical fragmentation.
+        # If hblkhd dominates -> mmap'd numpy arrays not released.
+        if _MALLINFO2 is not None:
+            try:
+                mi = _MALLINFO2()
+                LOGGER.info(
+                    "  mallinfo2 arena=%.1f uord=%.1f ford=%.1f "
+                    "hblkhd=%.1f keepcost=%.1f MiB hblks=%d",
+                    mi.arena / (1024 * 1024),
+                    mi.uordblks / (1024 * 1024),
+                    mi.fordblks / (1024 * 1024),
+                    mi.hblkhd / (1024 * 1024),
+                    mi.keepcost / (1024 * 1024),
+                    mi.hblks,
+                )
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception("mallinfo2 read failed")
+
+        # SQLAlchemy engine + compiled-statement-cache state. The
+        # compiled cache holds Compiled query objects keyed by SQL +
+        # bindparam shape. Default size 500. If it's full or growing,
+        # each entry retains Column/type descriptors and can pin
+        # surprisingly large transitive state.
+        if worker is not None and getattr(worker, "_engine", None) is not None:
+            engine = worker._engine
+            try:
+                pool_status = engine.pool.status()
+                cache = getattr(engine, "_compiled_cache", None)
+                cache_size = len(cache) if cache is not None else -1
+                LOGGER.info(
+                    "  sqlalchemy pool=%s compiled_cache=%d",
+                    pool_status, cache_size,
+                )
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception("sqlalchemy state read failed")
+
+            # Peek into the psycopg2 connections held by the pool. A
+            # connection that's `idle in transaction` would be the
+            # likely culprit if Postgres backend memory was the leak;
+            # a high `prepared_statement` count would point to
+            # psycopg2's type-cache / prepared cache growing.
+            try:
+                # Walk pool._pool (LifoQueue) without dequeueing.
+                # _ConnectionRecord.dbapi_connection is the live
+                # psycopg2 connection.
+                records = list(getattr(engine.pool, "_pool", []).queue)  # type: ignore[attr-defined]
+                for i, rec in enumerate(records):
+                    raw = getattr(rec, "dbapi_connection", None) or getattr(
+                        rec, "connection", None
+                    )
+                    if raw is None:
+                        continue
+                    info = getattr(raw, "info", None)
+                    tx_status = getattr(info, "transaction_status", "?") if info else "?"
+                    backend_pid = getattr(info, "backend_pid", "?") if info else "?"
+                    closed = getattr(raw, "closed", "?")
+                    LOGGER.info(
+                        "  psycopg2[%d] backend_pid=%s tx_status=%s closed=%s",
+                        i, backend_pid, tx_status, closed,
+                    )
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception("psycopg2 pool inspect failed")
+
+        # Walk the Python heap for the type histogram + growers. Costs
+        # ~50-150 ms once per 10 min (one full gc.get_objects() pass)
+        # in the scheduler thread — never blocks workers.
+        try:
+            _log_deep_memory_probes()
+        except Exception:  # pylint: disable=broad-except
+            LOGGER.exception("deep memory probe failed")
 
         if tracemalloc.is_tracing():
             snap = tracemalloc.take_snapshot()
@@ -213,6 +447,22 @@ def _log_memory_summary(worker: "Worker | None" = None) -> None:
                 LOGGER.info(
                     "    %-60s %6.2f MiB (%d allocs)",
                     fname,
+                    stat.size / (1024 * 1024),
+                    stat.count,
+                )
+
+            # Line-level top — filename rolls up too coarsely when
+            # one file has many distinct allocation sites (psycopg2's
+            # `cursor.py` is a classic offender). The lineno key
+            # pinpoints the actual offending line of source.
+            line_stats = snap.statistics("lineno")[:20]
+            LOGGER.info("  tracemalloc cumulative top 20 by lineno:")
+            for stat in line_stats:
+                frame = stat.traceback[0]
+                src = f"{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno}"
+                LOGGER.info(
+                    "    %-60s %6.2f MiB (%d allocs)",
+                    src[:60],
                     stat.size / (1024 * 1024),
                     stat.count,
                 )
