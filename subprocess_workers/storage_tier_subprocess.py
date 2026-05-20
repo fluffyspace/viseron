@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import tracemalloc
+from collections import OrderedDict
 from collections.abc import Callable
 from queue import Empty, Queue
 from typing import Any
@@ -211,6 +212,96 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(tz=datetime.timezone.utc)
 
 
+class DedupCheckQueue:
+    """A FIFO queue that dedupes check_tier items by throttle_key.
+
+    Drop-in replacement for `queue.Queue` in the check_tier dispatch
+    path. When a new item arrives for an already-queued
+    `(camera_identifier, throttle_key)`, the older entry is removed
+    and the new one is appended at the tail. Same `.put` / `.get`
+    signature so dispatcher_task and worker_task_mixed need no other
+    change. `.get(timeout=...)` raises `queue.Empty` on timeout to
+    match.
+
+    Why: check_tier reads current DB + filesystem state, so multiple
+    queued items for the same throttle_key are redundant — only the
+    most recent invocation carries useful information. When workers
+    are saturated by file_queue (move_file/delete_file are O(100ms);
+    check_tier is O(10-100s)), the previous unbounded check_queue
+    would retain ~9k DataItem instances per 10 min on Kodba (proven
+    by gc.get_objects() type histogram, commit 2530ad23) — that
+    accumulation, *not* glibc fragmentation, was the source of the
+    storage subprocess RSS climbing to 2.9 GiB at 47 h uptime.
+
+    Bounded by physics: max items = N_cameras × N_throttle_keys ≈ 20
+    on this install, regardless of input rate.
+
+    Note: when a stale item is replaced, its callback in the parent's
+    TierCheckWorker._callbacks dict is never popped (the subprocess
+    only emits a reply for the surviving item). That dict is already
+    FIFO-capped at MAX_PENDING_CALLBACKS=10_000, so orphans drain
+    naturally — check_tier callbacks do no cleanup work that requires
+    them to fire (unlike move_file, which is why move_file is NOT
+    dedup'd here).
+    """
+
+    def __init__(self) -> None:
+        self._items: "OrderedDict[tuple[str, str], Any]" = OrderedDict()
+        self._cond = threading.Condition()
+        # Cumulative counter of how many puts replaced an existing key;
+        # drained to 0 by drain_metrics(). High-water mark is also
+        # tracked so the memory summary can show whether the queue is
+        # actually staying small.
+        self._replaced = 0
+        self._max_size = 0
+
+    def put(self, item: Any) -> None:
+        """Insert item, replacing any same-key item already queued."""
+        key = (item.camera_identifier, item.throttle_key)
+        with self._cond:
+            if self._items.pop(key, None) is not None:
+                self._replaced += 1
+            self._items[key] = item
+            n = len(self._items)
+            if n > self._max_size:
+                self._max_size = n
+            self._cond.notify()
+
+    def get(self, timeout: float | None = None) -> Any:
+        """Pop oldest item; block up to timeout. Raise Empty on timeout."""
+        with self._cond:
+            end_time = None if timeout is None else time.monotonic() + timeout
+            while not self._items:
+                if timeout is None:
+                    self._cond.wait()
+                else:
+                    remaining = end_time - time.monotonic()  # type: ignore[operator]
+                    if remaining <= 0:
+                        raise Empty
+                    self._cond.wait(remaining)
+            _, item = self._items.popitem(last=False)
+            return item
+
+    def qsize(self) -> int:
+        with self._cond:
+            return len(self._items)
+
+    def drain_metrics(self) -> tuple[int, int, int]:
+        """Return (current_size, max_size_since_drain, replaced_since_drain).
+
+        Resets the high-water mark and replaced counter. Called from
+        _log_memory_summary so each 10-min window shows what happened
+        in that window.
+        """
+        with self._cond:
+            current = len(self._items)
+            max_size = self._max_size
+            replaced = self._replaced
+            self._max_size = current
+            self._replaced = 0
+            return current, max_size, replaced
+
+
 def _load_malloc_trim() -> Callable[[], None] | None:
     """Resolve glibc's malloc_trim so we can return freed heap to the OS.
 
@@ -286,7 +377,10 @@ def _log_deep_memory_probes() -> None:
     _LAST_GC_HISTOGRAM = dict(hist)
 
 
-def _log_memory_summary(worker: "Worker | None" = None) -> None:
+def _log_memory_summary(
+    worker: "Worker | None" = None,
+    check_queue: "DedupCheckQueue | None" = None,
+) -> None:
     """Emit RSS, per-command metrics, gc state, and tracemalloc diff.
 
     Written line-by-line because the main process's LogPipe splits on
@@ -325,6 +419,13 @@ def _log_memory_summary(worker: "Worker | None" = None) -> None:
                     max_rss_mib,
                     avg_ms,
                 )
+
+        if check_queue is not None:
+            current, max_size, replaced = check_queue.drain_metrics()
+            LOGGER.info(
+                "  check_queue current=%d max=%d replaced=%d",
+                current, max_size, replaced,
+            )
 
         # gc.get_count() is the per-generation allocation counter
         # since the last collection of that generation — NOT live
@@ -1118,13 +1219,21 @@ def main() -> None:
     scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
     scheduler.start()
 
+    check_queue = DedupCheckQueue()
+    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile] = Queue()
+
     scheduler.add_job(
         _log_memory_summary,
         "date",
         run_date=_utcnow() + datetime.timedelta(seconds=30),
-        args=[worker],
+        args=[worker, check_queue],
     )
-    scheduler.add_job(_log_memory_summary, "interval", minutes=10, args=[worker])
+    scheduler.add_job(
+        _log_memory_summary,
+        "interval",
+        minutes=10,
+        args=[worker, check_queue],
+    )
     scheduler.add_job(worker.recycle_engine, "interval", minutes=15)
     # Periodic malloc_trim independent of check_tier. The per-check trim
     # in Worker.check_tier only fires when a tier check completes (every
@@ -1135,9 +1244,6 @@ def main() -> None:
     # (microseconds when arenas are clean) and keeps RSS bounded.
     if trim is not None:
         scheduler.add_job(trim, "interval", seconds=60)
-
-    check_queue: Queue[DataItem] = Queue()
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile] = Queue()
 
     threading.Thread(
         name="storage_subprocess.dispatcher",
