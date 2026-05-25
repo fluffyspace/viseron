@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import voluptuous as vol
 
-from viseron.components.webserver.api.handlers import BaseAPIHandler
+from viseron.components.webserver.api.handlers import BaseAPIHandler, require_auth
 from viseron.components.webserver.auth import (
     AuthenticationFailedError,
     InvalidRoleError,
@@ -62,6 +62,7 @@ class AuthAPIHandler(BaseAPIHandler):
             "path_pattern": r"/auth/login",
             "supported_methods": ["POST"],
             "method": "auth_login",
+            "rate_limit": "login",
             "json_body_schema": vol.Schema(
                 {
                     vol.Required("username"): str,
@@ -81,6 +82,7 @@ class AuthAPIHandler(BaseAPIHandler):
             "path_pattern": r"/auth/token",
             "supported_methods": ["POST"],
             "method": "auth_token",
+            "rate_limit": "token",
             "json_body_schema": vol.Schema(
                 {
                     vol.Required("grant_type", msg="Invalid grant_type"): vol.All(
@@ -157,11 +159,12 @@ class AuthAPIHandler(BaseAPIHandler):
         }
         await self.response_success(response=response)
 
+    @require_auth
     async def auth_create(self) -> None:
         """Create a new user."""
         try:
             await self.run_in_executor(
-                self._webserver.auth.add_user,
+                self.auth.add_user,
                 self.json_body["name"].strip(),
                 self.json_body["username"].strip().casefold(),
                 self.json_body["password"],
@@ -172,12 +175,13 @@ class AuthAPIHandler(BaseAPIHandler):
             return
         await self.response_success()
 
+    @require_auth
     async def auth_user(self, user_id: str) -> None:
         """Get a user.
 
         Returns 200 OK with user data if user exists.
         """
-        user = await self.run_in_executor(self._webserver.auth.get_user, user_id)
+        user = await self.run_in_executor(self.auth.get_user, user_id)
         if user is None:
             self.response_error(HTTPStatus.NOT_FOUND, reason="User not found")
             return
@@ -190,6 +194,7 @@ class AuthAPIHandler(BaseAPIHandler):
             }
         )
 
+    @require_auth
     async def auth_delete(self, user_id: str) -> None:
         """Delete a user."""
         if self.current_user and self.current_user.id == user_id:
@@ -199,7 +204,7 @@ class AuthAPIHandler(BaseAPIHandler):
             return
 
         try:
-            await self.run_in_executor(self._webserver.auth.delete_user, user_id)
+            await self.run_in_executor(self.auth.delete_user, user_id)
         except UserDoesNotExistError as error:
             self.response_error(HTTPStatus.NOT_FOUND, reason=str(error))
             return
@@ -209,11 +214,12 @@ class AuthAPIHandler(BaseAPIHandler):
 
         await self.response_success()
 
+    @require_auth
     async def auth_login(self) -> None:
         """Login."""
         try:
             user = await self.run_in_executor(
-                self._webserver.auth.validate_user,
+                self.auth.validate_user,
                 self.json_body["username"],
                 self.json_body["password"],
             )
@@ -223,14 +229,16 @@ class AuthAPIHandler(BaseAPIHandler):
             )
             return
 
+        self.reset_rate_limit("login")
+
         refresh_token = await self.run_in_executor(
-            self._webserver.auth.generate_refresh_token,
+            self.auth.generate_refresh_token,
             user.id,
             self.json_body["client_id"],
             "normal",
         )
         access_token = await self.run_in_executor(
-            self._webserver.auth.generate_access_token,
+            self.auth.generate_access_token,
             refresh_token,
             self.request.remote_ip,
         )
@@ -244,17 +252,18 @@ class AuthAPIHandler(BaseAPIHandler):
             ),
         )
 
+    @require_auth
     async def auth_logout(self) -> None:
         """Logout."""
         refresh_token_cookie = self.get_secure_cookie("refresh_token")
         if refresh_token_cookie is not None:
             refresh_token = await self.run_in_executor(
-                self._webserver.auth.get_refresh_token_from_token,
+                self.auth.get_refresh_token_from_token,
                 refresh_token_cookie.decode(),
             )
             if refresh_token is not None:
                 await self.run_in_executor(
-                    self._webserver.auth.delete_refresh_token, refresh_token
+                    self.auth.delete_refresh_token, refresh_token
                 )
 
         self.clear_all_cookies()
@@ -263,33 +272,50 @@ class AuthAPIHandler(BaseAPIHandler):
     def _handle_refresh_token(
         self,
     ) -> (
-        tuple[Literal[HTTPStatus.BAD_REQUEST], str]
-        | tuple[Literal[HTTPStatus.OK], dict[str, Any]]
+        tuple[Literal[HTTPStatus.BAD_REQUEST], str, bool]
+        | tuple[Literal[HTTPStatus.OK], dict[str, Any], bool]
     ):
         """Handle refresh token."""
         refresh_token_cookie = self.get_secure_cookie("refresh_token")
         if refresh_token_cookie is None:
-            return HTTPStatus.BAD_REQUEST, "Invalid refresh token"
+            return HTTPStatus.BAD_REQUEST, "Invalid refresh token", True
 
-        refresh_token = self._webserver.auth.get_refresh_token_from_token(
-            refresh_token_cookie.decode()
+        refresh_token_cookie_value = refresh_token_cookie.decode()
+
+        refresh_token = self.auth.get_refresh_token_from_token(
+            refresh_token_cookie_value
         )
 
         if refresh_token is None:
-            return HTTPStatus.BAD_REQUEST, "Invalid grant"
+            clear_cookies = not self.auth.is_recent_refresh_token_reuse(
+                refresh_token_cookie_value, self.json_body["client_id"]
+            )
+            return HTTPStatus.BAD_REQUEST, "Invalid grant", clear_cookies
 
         if refresh_token.client_id != self.json_body["client_id"]:
-            return HTTPStatus.BAD_REQUEST, "Invalid client_id"
+            return HTTPStatus.BAD_REQUEST, "Invalid client_id", True
 
-        user = self._webserver.auth.get_user(refresh_token.user_id)
+        user = self.auth.get_user(refresh_token.user_id)
         if user is None:
-            return HTTPStatus.BAD_REQUEST, "Invalid user"
+            return HTTPStatus.BAD_REQUEST, "Invalid user", True
 
-        access_token = self._webserver.auth.generate_access_token(
+        # Rotate the refresh token. The previous one is revoked atomically; a
+        # stolen pre-rotation copy can no longer be exchanged for an access
+        # token. Absolute session expiry is preserved by the rotation logic.
+        refresh_token = self.auth.rotate_refresh_token(refresh_token)
+        if refresh_token is None:
+            clear_cookies = not self.auth.is_recent_refresh_token_reuse(
+                refresh_token_cookie_value, self.json_body["client_id"]
+            )
+            return HTTPStatus.BAD_REQUEST, "Invalid grant", clear_cookies
+
+        access_token = self.auth.generate_access_token(
             refresh_token, self.request.remote_ip
         )
 
-        self.set_cookies(refresh_token, access_token, user, new_session=False)
+        # The refresh-token cookie value changed, so all session cookies must
+        # be re-issued (treated like a new session for cookie purposes).
+        self.set_cookies(refresh_token, access_token, user, new_session=True)
 
         return (
             HTTPStatus.OK,
@@ -297,16 +323,21 @@ class AuthAPIHandler(BaseAPIHandler):
                 refresh_token,
                 access_token,
             ),
+            False,
         )
 
+    @require_auth
     async def auth_token(self) -> None:
         """Handle token request."""
         if self.json_body["grant_type"] == "refresh_token":
-            status, response = await self.run_in_executor(self._handle_refresh_token)
+            status, response, clear_cookies = await self.run_in_executor(
+                self._handle_refresh_token
+            )
             if status == HTTPStatus.OK:
                 await self.response_success(response=response)
                 return
-            self.clear_all_cookies()
+            if clear_cookies:
+                self.clear_all_cookies()
             # Mypy doesn't understand that status is HTTPStatus.BAD_REQUEST here
             self.response_error(status, response)  # type: ignore[arg-type]
             return
@@ -317,13 +348,15 @@ class AuthAPIHandler(BaseAPIHandler):
             reason="Invalid grant_type",
         )
 
+    @require_auth
     async def auth_users(self) -> None:
         """Get all users."""
-        users = await self.run_in_executor(self._webserver.auth.get_users)
+        users = await self.run_in_executor(self.auth.get_users)
         response = {}
         response["users"] = list(users.values())
         await self.response_success(response=response)
 
+    @require_auth
     async def auth_admin_change_password(self, user_id: str) -> None:
         """Change the password of a user as an admin."""
         if self.current_user and self.current_user.role != Role.ADMIN:
@@ -335,7 +368,7 @@ class AuthAPIHandler(BaseAPIHandler):
 
         try:
             await self.run_in_executor(
-                self._webserver.auth.change_password,
+                self.auth.change_password,
                 user_id,
                 self.json_body["new_password"],
             )
@@ -345,11 +378,12 @@ class AuthAPIHandler(BaseAPIHandler):
 
         await self.response_success()
 
+    @require_auth
     async def auth_update_user(self, user_id: str) -> None:
         """Update user details."""
         try:
             await self.run_in_executor(
-                self._webserver.auth.update_user,
+                self.auth.update_user,
                 user_id,
                 self.json_body["name"],
                 self.json_body["username"],

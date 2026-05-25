@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import datetime
 import enum
+import hashlib
 import hmac
 import logging
 import os
@@ -72,6 +73,24 @@ class InvalidTimeFormatError(ViseronError):
     """Invalid time format specified."""
 
 
+class AccessTokenNotFoundError(ViseronError):
+    """Access token not found."""
+
+
+class AccessTokenLimitExceededError(ViseronError):
+    """Access token limit exceeded."""
+
+
+class SessionExpiredError(ViseronError):
+    """Refresh token session has expired."""
+
+
+MAX_ACCESS_TOKENS_PER_USER = 20
+MAX_TOKEN_NAME_LENGTH = 100
+PAT_LAST_USED_SAVE_INTERVAL = datetime.timedelta(minutes=1)
+REFRESH_TOKEN_REUSE_GRACE = datetime.timedelta(seconds=10)
+
+
 VALID_DATE_FORMATS = [
     "YYYY-MM-DD",
     "MM/DD/YYYY",
@@ -106,6 +125,44 @@ class RefreshToken:
     static_asset_key: str = field(default_factory=lambda: secrets.token_hex(64))
     used_at: float | None = None
     used_by: str | None = None
+
+
+@dataclass
+class RecentlyRotatedRefreshToken:
+    """Recently rotated refresh token metadata."""
+
+    client_id: str
+    replacement_id: str
+    expires_at: float
+
+
+@dataclass
+class AccessToken:
+    """Personal access token.
+
+    Used to access the API from third-party clients.
+    Only the SHA-256 hash of the raw token is ever stored.
+    """
+
+    user_id: str
+    name: str
+    token_hash: str
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    created_at: float = field(default_factory=lambda: utcnow().timestamp())
+    expires_at: float | None = None
+    last_used_at: float | None = None
+    last_used_by: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """Convert to dict, excluding the token_hash."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "last_used_at": self.last_used_at,
+            "last_used_by": self.last_used_by,
+        }
 
 
 class Role(enum.Enum):
@@ -203,9 +260,15 @@ class Auth:
         self._config = config
         self._users: dict[str, User] | None = None
         self._refresh_tokens: dict[str, RefreshToken] | None = None
+        self._access_tokens: dict[str, AccessToken] | None = None
+        self._pat_last_used_persisted_at: dict[str, float] = {}
+        self._recent_refresh_token_rotations: dict[
+            str, RecentlyRotatedRefreshToken
+        ] = {}
         self._auth_store = Storage(vis, AUTH_STORAGE_KEY)
         self._data_lock = Lock()
         self._user_lock = Lock()
+        self._decoy_jwt_key = secrets.token_hex(64)
 
     @property
     def users(self) -> dict[str, User]:
@@ -226,6 +289,16 @@ class Auth:
                 self._load()
                 assert self._refresh_tokens is not None  # noqa: S101
         return self._refresh_tokens
+
+    @property
+    def access_tokens(self) -> dict[str, AccessToken]:
+        """Return personal access tokens."""
+        with self._data_lock:
+            if self._access_tokens is None:
+                LOGGER.debug("Loading access tokens")
+                self._load()
+                assert self._access_tokens is not None  # noqa: S101
+        return self._access_tokens
 
     @property
     def session_expiry(self) -> datetime.timedelta | None:
@@ -350,6 +423,7 @@ class Auth:
                     raise LastAdminUserError("Cannot delete the last admin user")
 
             LOGGER.debug(f"Deleting user {user_to_delete.username}")
+            self._revoke_all_for_user(user_id)
             del self.users[user_id]
             self.save()
 
@@ -361,6 +435,10 @@ class Auth:
 
             user = self.users[user_id]
             user.password = self.hash_password(new_password)
+            # Forcibly log the user out everywhere on password change. Anyone
+            # who knew the old password (e.g. an attacker the user is trying
+            # to lock out) loses access immediately.
+            self._revoke_all_for_user(user_id)
             LOGGER.debug(f"Password changed for user {user.username}")
             self.save()
 
@@ -461,6 +539,7 @@ class Auth:
 
         users: dict[str, User] = {}
         refresh_tokens: dict[str, RefreshToken] = {}
+        access_tokens: dict[str, AccessToken] = {}
 
         for user in data.get("users", {}).values():
             preferences: Preferences | None = None
@@ -499,13 +578,30 @@ class Auth:
                 used_by=refresh_token["used_by"],
             )
 
+        for pat in data.get("access_tokens", {}).values():
+            access_tokens[pat["id"]] = AccessToken(
+                user_id=pat["user_id"],
+                name=pat["name"],
+                token_hash=pat["token_hash"],
+                id=pat["id"],
+                created_at=pat["created_at"],
+                expires_at=pat.get("expires_at"),
+                last_used_at=pat.get("last_used_at"),
+                last_used_by=pat.get("last_used_by"),
+            )
+
         self._users = users
         self._refresh_tokens = refresh_tokens
+        self._access_tokens = access_tokens
 
     def save(self) -> None:
         """Save users to storage."""
         self._auth_store.save(
-            {"users": self.users, "refresh_tokens": self.refresh_tokens}
+            {
+                "users": self.users,
+                "refresh_tokens": self.refresh_tokens,
+                "access_tokens": {t.id: asdict(t) for t in self.access_tokens.values()},
+            }
         )
 
     def generate_refresh_token(
@@ -516,52 +612,146 @@ class Auth:
         access_token_expiration: datetime.timedelta = ACCESS_TOKEN_EXPIRATION,
     ) -> RefreshToken:
         """Generate refresh token."""
-        refresh_token = RefreshToken(
-            user_id=user_id,
-            client_id=client_id,
-            session_expiration=(self.session_expiry or datetime.timedelta(days=3650)),
-            access_token_type=access_token_type,
-            access_token_expiration=access_token_expiration,
-        )
-        self.refresh_tokens[refresh_token.id] = refresh_token
-        self.save()
+        with self._user_lock:
+            refresh_token = RefreshToken(
+                user_id=user_id,
+                client_id=client_id,
+                session_expiration=(
+                    self.session_expiry or datetime.timedelta(days=3650)
+                ),
+                access_token_type=access_token_type,
+                access_token_expiration=access_token_expiration,
+            )
+            self.refresh_tokens[refresh_token.id] = refresh_token
+            self.save()
         return refresh_token
 
     def get_refresh_token(self, refresh_token_id: str) -> RefreshToken | None:
         """Get refresh token."""
-        return self.refresh_tokens.get(refresh_token_id, None)
+        with self._user_lock:
+            return self.refresh_tokens.get(refresh_token_id, None)
 
     def get_refresh_token_from_token(self, token: str) -> RefreshToken | None:
         """Get refresh token from token."""
         found_token = None
 
-        for refresh_token in self.refresh_tokens.values():
-            if hmac.compare_digest(refresh_token.token, token):
-                found_token = refresh_token
+        with self._user_lock:
+            for refresh_token in self.refresh_tokens.values():
+                if hmac.compare_digest(refresh_token.token, token):
+                    found_token = refresh_token
 
         return found_token
 
     def delete_refresh_token(self, refresh_token: RefreshToken) -> None:
         """Delete refresh token."""
-        if refresh_token.id in self.refresh_tokens:
-            del self.refresh_tokens[refresh_token.id]
+        with self._user_lock:
+            if refresh_token.id in self.refresh_tokens:
+                del self.refresh_tokens[refresh_token.id]
+                self.save()
+
+    @staticmethod
+    def _hash_refresh_token(token: str) -> str:
+        """Hash a refresh token secret for short-lived reuse tracking."""
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def _purge_recent_refresh_token_rotations(self) -> None:
+        """Purge expired or orphaned refresh-token rotation records."""
+        now = utcnow().timestamp()
+        expired_token_hashes = [
+            token_hash
+            for token_hash, rotation in self._recent_refresh_token_rotations.items()
+            if rotation.expires_at <= now
+            or rotation.replacement_id not in self.refresh_tokens
+        ]
+        for token_hash in expired_token_hashes:
+            del self._recent_refresh_token_rotations[token_hash]
+
+    def is_recent_refresh_token_reuse(self, token: str, client_id: str) -> bool:
+        """Return true if a refresh token was just rotated for this client."""
+        token_hash = self._hash_refresh_token(token)
+        with self._user_lock:
+            self._purge_recent_refresh_token_rotations()
+            rotation = self._recent_refresh_token_rotations.get(token_hash)
+            if rotation is None:
+                return False
+            if not hmac.compare_digest(rotation.client_id, client_id):
+                return False
+            return rotation.replacement_id in self.refresh_tokens
+
+    def rotate_refresh_token(self, old: RefreshToken) -> RefreshToken | None:
+        """Rotate a refresh token.
+
+        Issues a brand-new refresh token (new id, token, jwt key, static asset
+        key) for the same user/client and revokes the old one. If the old
+        token has already been consumed, None is returned and no replacement is
+        issued. The absolute session expiry is preserved by copying created_at
+        and session_expiration from the old token, so a long-lived session
+        cannot be extended indefinitely by repeatedly refreshing.
+
+        If the absolute session expiry has already passed, the stored token is
+        revoked and None is returned.
+        """
+        with self._user_lock:
+            stored = self.refresh_tokens.get(old.id)
+            if stored is None or not hmac.compare_digest(stored.token, old.token):
+                return None
+
+            try:
+                self.validate_refresh_token(stored)
+            except SessionExpiredError:
+                del self.refresh_tokens[old.id]
+                self.save()
+                return None
+
+            new = RefreshToken(
+                user_id=stored.user_id,
+                client_id=stored.client_id,
+                session_expiration=stored.session_expiration,
+                access_token_type=stored.access_token_type,
+                access_token_expiration=stored.access_token_expiration,
+                created_at=stored.created_at,
+            )
+            self.refresh_tokens[new.id] = new
+            self._purge_recent_refresh_token_rotations()
+            self._recent_refresh_token_rotations[
+                self._hash_refresh_token(stored.token)
+            ] = RecentlyRotatedRefreshToken(
+                client_id=stored.client_id,
+                replacement_id=new.id,
+                expires_at=(
+                    utcnow().timestamp() + REFRESH_TOKEN_REUSE_GRACE.total_seconds()
+                ),
+            )
+            del self.refresh_tokens[old.id]
             self.save()
+        return new
 
     def validate_refresh_token(self, refresh_token: RefreshToken) -> None:
-        """Validate refresh token."""
+        """Validate refresh token.
+
+        Raises SessionExpiredError if the absolute session expiry, computed
+        from the token's created_at plus session_expiration, has passed. This
+        enforces the stored session lifetime server-side so it cannot be
+        extended by repeatedly rotating the cookie.
+        """
+        session_expires_at = (
+            refresh_token.created_at + refresh_token.session_expiration.total_seconds()
+        )
+        if utcnow().timestamp() > session_expires_at:
+            raise SessionExpiredError
 
     def generate_access_token(
         self,
         refresh_token: RefreshToken,
-        remote_ip: str,
+        remote_ip: str | None,
         expiry: datetime.timedelta | None = None,
     ) -> str:
         """Generate access token using JWT."""
-        self.validate_refresh_token(refresh_token)
-        now = utcnow()
-        refresh_token.used_at = now.timestamp()
-        refresh_token.used_by = remote_ip
-        self.save()
+        with self._user_lock:
+            now = utcnow()
+            refresh_token.used_at = now.timestamp()
+            refresh_token.used_by = remote_ip
+            self.save()
         return jwt.encode(
             {
                 "iss": refresh_token.id,
@@ -584,12 +774,11 @@ class Auth:
             return None
 
         refresh_token = self.get_refresh_token(cast("str", unverif_claims.get("iss")))
-        if refresh_token is None:
-            jwt_key = ""
-            issuer = ""
-        else:
-            jwt_key = refresh_token.jwt_key
-            issuer = refresh_token.id
+
+        # Always perform a JWT verification regardless of whether the issuer
+        # was found, to keep timing uniform.
+        jwt_key = refresh_token.jwt_key if refresh_token else self._decoy_jwt_key
+        issuer = refresh_token.id if refresh_token else ""
 
         try:
             jwt.decode(
@@ -601,8 +790,157 @@ class Auth:
         if refresh_token is None:
             return None
 
+        try:
+            self.validate_refresh_token(refresh_token)
+        except SessionExpiredError:
+            self.delete_refresh_token(refresh_token)
+            return None
+
         user = self.get_user(refresh_token.user_id)
         if user is None or not user.enabled:
             return None
 
         return refresh_token
+
+    def create_access_token(
+        self,
+        user_id: str,
+        name: str,
+        expires_at: float | None = None,
+    ) -> tuple[AccessToken, str]:
+        """Create a new personal access token.
+
+        Returns the AccessToken record and the raw token string.
+        The raw token is only available at creation time and only its hash is stored.
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("Token name cannot be empty")
+        if len(name) > MAX_TOKEN_NAME_LENGTH:
+            raise ValueError(
+                f"Token name cannot exceed {MAX_TOKEN_NAME_LENGTH} characters"
+            )
+
+        with self._user_lock:
+            user_tokens = [
+                t for t in self.access_tokens.values() if t.user_id == user_id
+            ]
+            if len(user_tokens) >= MAX_ACCESS_TOKENS_PER_USER:
+                raise AccessTokenLimitExceededError(
+                    f"Maximum of {MAX_ACCESS_TOKENS_PER_USER} personal access tokens "
+                    "per user exceeded"
+                )
+
+            raw_token = "vpat_" + secrets.token_hex(64)
+            token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+            token = AccessToken(
+                user_id=user_id,
+                name=name,
+                token_hash=token_hash,
+                expires_at=expires_at,
+            )
+            self.access_tokens[token.id] = token
+            self.save()
+
+        return token, raw_token
+
+    def get_access_tokens_for_user(self, user_id: str) -> list[AccessToken]:
+        """Return all personal access tokens for a user."""
+        return [t for t in self.access_tokens.values() if t.user_id == user_id]
+
+    def delete_access_token(self, token_id: str, user_id: str) -> None:
+        """Delete a personal access token.
+
+        Raises AccessTokenNotFoundError if the token does not exist or does not
+        belong to the given user.
+        """
+        with self._user_lock:
+            token = self.access_tokens.get(token_id)
+            if token is None or token.user_id != user_id:
+                raise AccessTokenNotFoundError(f"Access token {token_id} not found")
+            self._pat_last_used_persisted_at.pop(token_id, None)
+            del self.access_tokens[token_id]
+            self.save()
+
+    def validate_access_token_pat(self, raw_token: str) -> AccessToken | None:
+        """Validate a raw personal access token string.
+
+        Computes the SHA-256 hash of the supplied token and performs a
+        timing-safe comparison against every stored hash to prevent timing attacks.
+        Returns the matching AccessToken, or None if not found / expired.
+        """
+        incoming_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        found: AccessToken | None = None
+
+        with self._user_lock:
+            tokens_snapshot = list(self.access_tokens.values())
+
+        for token in tokens_snapshot:
+            if hmac.compare_digest(incoming_hash, token.token_hash):
+                found = token
+
+        if found is None:
+            return None
+
+        # Reject expired tokens
+        if found.expires_at is not None and utcnow().timestamp() > found.expires_at:
+            return None
+
+        return found
+
+    def update_pat_used(self, pat: AccessToken, remote_ip: str) -> None:
+        """Update the last-used metadata for a personal access token."""
+        now = utcnow().timestamp()
+
+        with self._user_lock:
+            stored_pat = self.access_tokens.get(pat.id)
+            if stored_pat is None:
+                return
+
+            last_persisted_at = self._pat_last_used_persisted_at.get(
+                stored_pat.id,
+                stored_pat.last_used_at or 0,
+            )
+            should_save = (
+                stored_pat.last_used_at is None
+                or stored_pat.last_used_by != remote_ip
+                or now - last_persisted_at
+                >= PAT_LAST_USED_SAVE_INTERVAL.total_seconds()
+            )
+
+            stored_pat.last_used_at = now
+            stored_pat.last_used_by = remote_ip
+
+            if should_save:
+                self.save()
+                self._pat_last_used_persisted_at[stored_pat.id] = now
+
+    def _revoke_all_for_user(self, user_id: str) -> None:
+        """Revoke all sessions and PATs for user_id without acquiring the lock.
+
+        Caller MUST hold self._user_lock. The store is not persisted
+        here either, the caller is expected to call self.save() after the
+        rest of its mutations.
+        """
+        rt_ids_to_delete = [
+            rt_id for rt_id, rt in self.refresh_tokens.items() if rt.user_id == user_id
+        ]
+        for rt_id in rt_ids_to_delete:
+            del self.refresh_tokens[rt_id]
+
+        pat_ids_to_delete = [
+            t_id for t_id, t in self.access_tokens.items() if t.user_id == user_id
+        ]
+        for t_id in pat_ids_to_delete:
+            self._pat_last_used_persisted_at.pop(t_id, None)
+            del self.access_tokens[t_id]
+
+    def revoke_all_for_user(self, user_id: str) -> None:
+        """Revoke all sessions (refresh tokens) and personal access tokens for a user.
+
+        This is a destructive, irreversible operation that forces the user to
+        re-authenticate on all devices and invalidates all PATs.
+        """
+        with self._user_lock:
+            self._revoke_all_for_user(user_id)
+            self.save()

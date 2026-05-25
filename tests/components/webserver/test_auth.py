@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import pytest
 from filelock import FileLock
 
 from viseron.components.webserver.auth import (
+    MAX_ACCESS_TOKENS_PER_USER,
+    REFRESH_TOKEN_REUSE_GRACE,
+    AccessTokenLimitExceededError,
+    AccessTokenNotFoundError,
     Auth,
     AuthenticationFailedError,
     InvalidRoleError,
     LastAdminUserError,
+    RefreshToken,
     Role,
+    SessionExpiredError,
     UserDoesNotExistError,
     UserExistsError,
     token_response,
@@ -163,6 +171,63 @@ class TestAuth:
         with pytest.raises(UserDoesNotExistError):
             self.auth.change_password("nonexistent_id", "new_password")
 
+    def test_change_password_revokes_all_sessions(self):
+        """Changing the password must invalidate all sessions and PATs."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        rt = self.auth.generate_refresh_token(user.id, "client", "normal")
+        _pat, raw = self.auth.create_access_token(user.id, "My PAT")
+
+        assert rt.id in self.auth.refresh_tokens
+        assert self.auth.validate_access_token_pat(raw) is not None
+
+        self.auth.change_password(user.id, "new_password")
+
+        # All credentials for that user are gone.
+        assert rt.id not in self.auth.refresh_tokens
+        assert self.auth.validate_access_token_pat(raw) is None
+        assert self.auth.get_access_tokens_for_user(user.id) == []
+
+    def test_change_password_does_not_revoke_other_users(self):
+        """Changing one user's password must not affect another user's tokens."""
+        user_a = self.auth.add_user("A", "a", "a", Role.ADMIN)
+        user_b = self.auth.add_user("B", "b", "b", Role.WRITE)
+        rt_b = self.auth.generate_refresh_token(user_b.id, "client", "normal")
+        _b_pat, b_raw = self.auth.create_access_token(user_b.id, "B PAT")
+
+        self.auth.change_password(user_a.id, "new_password")
+
+        assert rt_b.id in self.auth.refresh_tokens
+        assert self.auth.validate_access_token_pat(b_raw) is not None
+
+    def test_delete_user_revokes_all_sessions(self):
+        """Deleting a user must invalidate all their sessions and PATs."""
+        # Need an admin to remain so the test user can be deleted.
+        self.auth.add_user("Admin", "admin", "admin", Role.ADMIN)
+        user = self.auth.add_user("Test", "test", "test", Role.WRITE)
+        rt = self.auth.generate_refresh_token(user.id, "client", "normal")
+        _pat, raw = self.auth.create_access_token(user.id, "My PAT")
+
+        self.auth.delete_user(user.id)
+
+        assert user.id not in self.auth.users
+        assert rt.id not in self.auth.refresh_tokens
+        assert self.auth.validate_access_token_pat(raw) is None
+
+    def test_delete_user_does_not_revoke_other_users(self):
+        """Deleting one user must not affect another user's tokens."""
+        admin = self.auth.add_user("Admin", "admin", "admin", Role.ADMIN)
+        user_b = self.auth.add_user("B", "b", "b", Role.WRITE)
+        rt_b = self.auth.generate_refresh_token(user_b.id, "client", "normal")
+        _b_pat, b_raw = self.auth.create_access_token(user_b.id, "B PAT")
+
+        # Delete a third user that has no tokens, verify B's are intact.
+        target = self.auth.add_user("Target", "target", "target", Role.WRITE)
+        self.auth.delete_user(target.id)
+
+        assert admin.id in self.auth.users
+        assert rt_b.id in self.auth.refresh_tokens
+        assert self.auth.validate_access_token_pat(b_raw) is not None
+
     def test_update_user(self):
         """Test updating a user's details."""
         user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
@@ -255,6 +320,262 @@ class TestAuth:
 
         self.auth.delete_refresh_token(refresh_token)
         assert self.auth.get_refresh_token_from_token(refresh_token.token) is None
+
+    def test_rotate_refresh_token_rejects_already_consumed_token(self):
+        """Test rotating an already-consumed refresh token."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+
+        rotated_token = self.auth.rotate_refresh_token(refresh_token)
+        assert rotated_token is not None
+        assert refresh_token.id not in self.auth.refresh_tokens
+        assert rotated_token.id in self.auth.refresh_tokens
+
+        token_count = len(self.auth.refresh_tokens)
+        assert self.auth.rotate_refresh_token(refresh_token) is None
+        assert len(self.auth.refresh_tokens) == token_count
+
+    def test_rotate_refresh_token_issues_new_secrets(self):
+        """Rotation issues a brand-new token with fresh secrets."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+
+        rotated = self.auth.rotate_refresh_token(refresh_token)
+        assert rotated is not None
+        assert rotated.id != refresh_token.id
+        assert rotated.token != refresh_token.token
+        assert rotated.jwt_key != refresh_token.jwt_key
+        assert rotated.static_asset_key != refresh_token.static_asset_key
+
+    def test_rotate_refresh_token_preserves_session_metadata(self):
+        """Rotation must not extend the absolute session window."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+
+        rotated = self.auth.rotate_refresh_token(refresh_token)
+        assert rotated is not None
+        assert rotated.created_at == refresh_token.created_at
+        assert rotated.session_expiration == refresh_token.session_expiration
+        assert rotated.user_id == refresh_token.user_id
+        assert rotated.client_id == refresh_token.client_id
+        assert rotated.access_token_type == refresh_token.access_token_type
+        assert rotated.access_token_expiration == refresh_token.access_token_expiration
+
+    def test_rotate_refresh_token_replay_rejected(self):
+        """A second rotation of the same token (replay) is rejected."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        # Snapshot the pre-rotation token to simulate a concurrent/leaked copy.
+        old_id = refresh_token.id
+        old_token = refresh_token.token
+
+        first = self.auth.rotate_refresh_token(refresh_token)
+        assert first is not None
+        assert self.auth.is_recent_refresh_token_reuse(old_token, "test_client")
+        assert not self.auth.is_recent_refresh_token_reuse(old_token, "other_client")
+
+        # Replay attempt with the original token must fail and not add a token.
+        replay = RefreshToken(
+            user_id=refresh_token.user_id,
+            client_id=refresh_token.client_id,
+            session_expiration=refresh_token.session_expiration,
+            access_token_type=refresh_token.access_token_type,
+            access_token_expiration=refresh_token.access_token_expiration,
+            created_at=refresh_token.created_at,
+            id=old_id,
+            token=old_token,
+        )
+        token_count = len(self.auth.refresh_tokens)
+        assert self.auth.rotate_refresh_token(replay) is None
+        assert len(self.auth.refresh_tokens) == token_count
+        assert old_id not in self.auth.refresh_tokens
+
+    def test_rotate_refresh_token_tampered_token_rejected(self):
+        """Rotation rejects a token whose secret has been tampered with."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        tampered = RefreshToken(
+            user_id=refresh_token.user_id,
+            client_id=refresh_token.client_id,
+            session_expiration=refresh_token.session_expiration,
+            access_token_type=refresh_token.access_token_type,
+            access_token_expiration=refresh_token.access_token_expiration,
+            created_at=refresh_token.created_at,
+            id=refresh_token.id,
+            token="tampered",  # noqa: S106
+        )
+        assert self.auth.rotate_refresh_token(tampered) is None
+        assert refresh_token.id in self.auth.refresh_tokens
+
+    def test_validate_refresh_token_expired_session(self):
+        """validate_refresh_token raises once the absolute window has passed."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        # Move the issue time far enough into the past that any reasonable
+        # session_expiration (including the 3650-day infinite sentinel) is gone.
+        refresh_token.created_at = time.time() - timedelta(days=3651).total_seconds()
+
+        with pytest.raises(SessionExpiredError):
+            self.auth.validate_refresh_token(refresh_token)
+
+    def test_validate_refresh_token_within_session(self):
+        """validate_refresh_token does not raise while still within the window."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        # Default config has session_expiry=None -> 3650 days, freshly created.
+        self.auth.validate_refresh_token(refresh_token)
+
+    def test_rotate_refresh_token_expired_session_revokes(self):
+        """An expired session is revoked rather than rotated."""
+        config: dict[str, Any] = {"auth": {"session_expiry": {"hours": 1}}}
+        auth = Auth(self.auth._vis, config)
+
+        user = auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        # Force the token to be older than the configured 1h session window.
+        refresh_token.created_at = time.time() - timedelta(hours=2).total_seconds()
+        auth.refresh_tokens[refresh_token.id].created_at = refresh_token.created_at
+
+        assert auth.rotate_refresh_token(refresh_token) is None
+        assert refresh_token.id not in auth.refresh_tokens
+
+    def test_is_recent_refresh_token_reuse_unknown_token(self):
+        """Unknown tokens are never reported as recently rotated."""
+        assert (
+            self.auth.is_recent_refresh_token_reuse("not-a-token", "test_client")
+            is False
+        )
+
+    def test_is_recent_refresh_token_reuse_after_rotation(self):
+        """Old token + matching client_id is reported as recent reuse."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        old_token = refresh_token.token
+
+        rotated = self.auth.rotate_refresh_token(refresh_token)
+        assert rotated is not None
+
+        assert self.auth.is_recent_refresh_token_reuse(old_token, "test_client")
+        assert not self.auth.is_recent_refresh_token_reuse(old_token, "other_client")
+
+    def test_is_recent_refresh_token_reuse_after_grace_expires(self):
+        """Grace window expires after REFRESH_TOKEN_REUSE_GRACE."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        old_token = refresh_token.token
+
+        assert self.auth.rotate_refresh_token(refresh_token) is not None
+        assert self.auth.is_recent_refresh_token_reuse(old_token, "test_client")
+
+        # Advance the clock past the grace window.
+        future = (
+            datetime.now(timezone.utc)
+            + REFRESH_TOKEN_REUSE_GRACE
+            + timedelta(seconds=1)
+        )
+        with patch("viseron.components.webserver.auth.utcnow", return_value=future):
+            assert not self.auth.is_recent_refresh_token_reuse(old_token, "test_client")
+
+        # The expired entry is purged on lookup.
+        token_hash = Auth._hash_refresh_token(old_token)
+        assert token_hash not in self.auth._recent_refresh_token_rotations
+
+    def test_is_recent_refresh_token_reuse_after_replacement_revoked(self):
+        """When the replacement token is gone, the entry is orphaned and purged."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        old_token = refresh_token.token
+
+        rotated = self.auth.rotate_refresh_token(refresh_token)
+        assert rotated is not None
+
+        # Revoke the replacement.
+        self.auth.delete_refresh_token(rotated)
+
+        assert not self.auth.is_recent_refresh_token_reuse(old_token, "test_client")
+        token_hash = Auth._hash_refresh_token(old_token)
+        assert token_hash not in self.auth._recent_refresh_token_rotations
+
+    def test_rotate_refresh_token_records_recent_rotation(self):
+        """rotate_refresh_token records grace metadata for the old token."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        refresh_token = self.auth.generate_refresh_token(
+            user.id, "test_client", "normal", timedelta(seconds=3600)
+        )
+        old_token = refresh_token.token
+
+        before = time.time()
+        rotated = self.auth.rotate_refresh_token(refresh_token)
+        after = time.time()
+        assert rotated is not None
+
+        token_hash = Auth._hash_refresh_token(old_token)
+        rotation = self.auth._recent_refresh_token_rotations[token_hash]
+        assert rotation.client_id == "test_client"
+        assert rotation.replacement_id == rotated.id
+        assert (
+            before + REFRESH_TOKEN_REUSE_GRACE.total_seconds()
+            <= rotation.expires_at
+            <= after + REFRESH_TOKEN_REUSE_GRACE.total_seconds()
+        )
+
+    def test_rotate_refresh_token_purges_expired_entries_on_new_rotation(self):
+        """A later rotation purges other entries whose grace already elapsed."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        first = self.auth.generate_refresh_token(
+            user.id, "client_a", "normal", timedelta(seconds=3600)
+        )
+        old_first_token = first.token
+        assert self.auth.rotate_refresh_token(first) is not None
+        assert (
+            Auth._hash_refresh_token(old_first_token)
+            in self.auth._recent_refresh_token_rotations
+        )
+
+        # Advance past the grace window, then rotate a second, independent token.
+        future = (
+            datetime.now(timezone.utc)
+            + REFRESH_TOKEN_REUSE_GRACE
+            + timedelta(seconds=1)
+        )
+        second = self.auth.generate_refresh_token(
+            user.id, "client_b", "normal", timedelta(seconds=3600)
+        )
+        old_second_token = second.token
+        with patch("viseron.components.webserver.auth.utcnow", return_value=future):
+            assert self.auth.rotate_refresh_token(second) is not None
+
+        # First entry is purged; second remains.
+        assert (
+            Auth._hash_refresh_token(old_first_token)
+            not in self.auth._recent_refresh_token_rotations
+        )
+        assert (
+            Auth._hash_refresh_token(old_second_token)
+            in self.auth._recent_refresh_token_rotations
+        )
 
     def test_get_refresh_token_from_token_invalid_token(self):
         """Test getting refresh token from invalid token."""
@@ -382,3 +703,169 @@ class TestAuth:
         response = token_response(refresh_token, access_token)
         assert response["header"] == header
         assert response["payload"] == payload
+
+
+class TestAccessToken:
+    """Tests for personal access token (PAT) management."""
+
+    def setup_method(self, vis: Viseron):
+        """Set up tests."""
+        self.auth = Auth(vis, WEBSERVER_CONFIG)
+        self.auth_store_lock = FileLock(f"{self.auth._auth_store.path}.lock")
+        self.onboarding_lock = FileLock(f"{self.auth.onboarding_path()}.lock")
+        self.auth_store_lock.acquire()
+        self.onboarding_lock.acquire()
+
+    def teardown_method(self):
+        """Teardown tests."""
+        if os.path.exists(self.auth._auth_store.path):
+            os.remove(self.auth._auth_store.path)
+        if os.path.exists(self.auth.onboarding_path()):
+            os.remove(self.auth.onboarding_path())
+        self.auth_store_lock.release()
+        self.onboarding_lock.release()
+
+    def test_create_access_token(self):
+        """Token is returned raw once; only its hash is stored."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        pat, raw_token = self.auth.create_access_token(user.id, "My Token")
+
+        assert raw_token.startswith("vpat_")
+        assert pat.id in self.auth.access_tokens
+        # Raw token must NOT be stored
+        assert self.auth.access_tokens[pat.id].token_hash != raw_token
+        # Hash round-trip: validate_access_token_pat must accept the raw token
+        assert self.auth.validate_access_token_pat(raw_token) is not None
+
+    def test_create_access_token_name_validation(self):
+        """Empty or whitespace-only names are rejected."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        with pytest.raises(ValueError, match="cannot be empty"):
+            self.auth.create_access_token(user.id, "")
+        with pytest.raises(ValueError, match="cannot be empty"):
+            self.auth.create_access_token(user.id, "   ")
+
+    def test_create_access_token_name_too_long(self):
+        """Names exceeding 100 characters are rejected."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        with pytest.raises(ValueError, match="cannot exceed 100"):
+            self.auth.create_access_token(user.id, "x" * 101)
+
+    def test_create_access_token_with_expiry(self):
+        """Optional expiry is stored on the token."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+
+        future = time.time() + 3600
+        pat, _raw = self.auth.create_access_token(
+            user.id, "Expiring", expires_at=future
+        )
+        assert pat.expires_at == future
+
+    def test_create_access_token_limit(self):
+        """Creating more than MAX_ACCESS_TOKENS_PER_USER raises an error."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        for i in range(MAX_ACCESS_TOKENS_PER_USER):
+            self.auth.create_access_token(user.id, f"Token {i}")
+        with pytest.raises(AccessTokenLimitExceededError):
+            self.auth.create_access_token(user.id, "One too many")
+
+    def test_get_access_tokens_for_user(self):
+        """Only tokens for the requested user are returned."""
+        user_a = self.auth.add_user("A", "a", "a", Role.ADMIN)
+        user_b = self.auth.add_user("B", "b", "b", Role.WRITE)
+        self.auth.create_access_token(user_a.id, "A token 1")
+        self.auth.create_access_token(user_a.id, "A token 2")
+        self.auth.create_access_token(user_b.id, "B token 1")
+
+        tokens_a = self.auth.get_access_tokens_for_user(user_a.id)
+        tokens_b = self.auth.get_access_tokens_for_user(user_b.id)
+        assert len(tokens_a) == 2
+        assert len(tokens_b) == 1
+
+    def test_delete_access_token(self):
+        """Deleting a token removes it from the store."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        pat, _raw = self.auth.create_access_token(user.id, "To delete")
+        self.auth.delete_access_token(pat.id, user.id)
+        assert pat.id not in self.auth.access_tokens
+
+    def test_delete_access_token_not_found(self):
+        """Deleting a non-existent token raises AccessTokenNotFoundError."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        with pytest.raises(AccessTokenNotFoundError):
+            self.auth.delete_access_token("nonexistent_id", user.id)
+
+    def test_delete_access_token_wrong_user(self):
+        """Deleting another user's token raises AccessTokenNotFoundError."""
+        user_a = self.auth.add_user("A", "a", "a", Role.ADMIN)
+        user_b = self.auth.add_user("B", "b", "b", Role.WRITE)
+        pat, _raw = self.auth.create_access_token(user_a.id, "A token")
+        with pytest.raises(AccessTokenNotFoundError):
+            self.auth.delete_access_token(pat.id, user_b.id)
+
+    def test_validate_access_token_pat(self):
+        """A valid raw token returns the corresponding AccessToken."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        pat, raw_token = self.auth.create_access_token(user.id, "Valid")
+        found = self.auth.validate_access_token_pat(raw_token)
+        assert found is not None
+        assert found.id == pat.id
+
+    def test_validate_access_token_pat_invalid_token(self):
+        """An unrecognised raw token returns None."""
+        self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        assert self.auth.validate_access_token_pat("vpat_notavalidtoken") is None
+
+    def test_validate_access_token_pat_expired(self):
+        """An expired PAT is rejected even if the hash matches."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        past = time.time() - 1
+        _pat, raw_token = self.auth.create_access_token(
+            user.id, "Expired", expires_at=past
+        )
+        assert self.auth.validate_access_token_pat(raw_token) is None
+
+    def test_access_token_load_save_round_trip(self, vis: MockViseron):
+        """Test that PATs survive a save-and-reload cycle."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        _pat, raw_token = self.auth.create_access_token(user.id, "Persistent")
+
+        auth2 = Auth(vis, WEBSERVER_CONFIG)
+        found = auth2.validate_access_token_pat(raw_token)
+        assert found is not None
+
+    def test_update_pat_used(self):
+        """After update_pat_used, last_used_at and last_used_by are set."""
+        user = self.auth.add_user("Test", "test", "test", Role.ADMIN)
+        pat, _raw = self.auth.create_access_token(user.id, "Used")
+        assert pat.last_used_at is None
+        self.auth.update_pat_used(pat, "192.168.1.1")
+        assert pat.last_used_at is not None
+        assert pat.last_used_by == "192.168.1.1"  # type: ignore[unreachable]
+
+    def test_revoke_all_for_user(self):
+        """revoke_all_for_user removes all sessions and PATs for the user only."""
+        user_a = self.auth.add_user("A", "a", "a", Role.ADMIN)
+        user_b = self.auth.add_user("B", "b", "b", Role.WRITE)
+
+        # Give user_a a session and a PAT
+        self.auth.generate_refresh_token(user_a.id, "client", "normal")
+        self.auth.create_access_token(user_a.id, "A PAT")
+
+        # Give user_b a session and a PAT (should survive)
+        rt_b = self.auth.generate_refresh_token(user_b.id, "client", "normal")
+        _b_pat, b_raw = self.auth.create_access_token(user_b.id, "B PAT")
+
+        self.auth.revoke_all_for_user(user_a.id)
+
+        # User A's tokens are gone
+        rts_a = [
+            rt for rt in self.auth.refresh_tokens.values() if rt.user_id == user_a.id
+        ]
+        pats_a = self.auth.get_access_tokens_for_user(user_a.id)
+        assert len(rts_a) == 0
+        assert len(pats_a) == 0
+
+        # User B's tokens are unaffected
+        assert rt_b.id in self.auth.refresh_tokens
+        assert self.auth.validate_access_token_pat(b_raw) is not None

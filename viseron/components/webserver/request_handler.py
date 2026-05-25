@@ -1,32 +1,35 @@
 """Viseron request handler."""
+
 from __future__ import annotations
 
 import hmac
 import logging
-from collections.abc import Callable
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 import pytz
 import tornado.web
-from sqlalchemy.orm import Session
 from tornado.ioloop import IOLoop
 
 from viseron.components.nvr.const import DOMAIN as NVR_DOMAIN
 from viseron.components.storage.const import COMPONENT as STORAGE_COMPONENT
 from viseron.components.webserver.auth import Role
 from viseron.components.webserver.const import COMPONENT
-from viseron.domain_registry import DomainEntry
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.exceptions import DomainNotRegisteredError
 from viseron.helpers import get_utc_offset, utcnow
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from sqlalchemy.orm import Session
+
     from viseron import Viseron
     from viseron.components.nvr.nvr import NVR
     from viseron.components.webserver import Webserver
     from viseron.components.webserver.auth import RefreshToken, User
+    from viseron.domain_registry import DomainEntry
     from viseron.domains.camera import AbstractCamera, FailedCamera
 
 _T = TypeVar("_T")
@@ -44,7 +47,7 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
         self._storage = vis.data[STORAGE_COMPONENT]
         self.current_user = None
         # Manually set xsrf cookie
-        self.xsrf_token  # pylint: disable=pointless-statement
+        self.xsrf_token  # pylint: disable=pointless-statement # noqa: B018
 
     async def run_in_executor(self, func: Callable[..., _T], *args) -> _T:
         """Run function in executor."""
@@ -79,7 +82,7 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
         return self._webserver
 
     @property
-    def status(self):
+    def status(self) -> int:
         """Return the status of the request."""
         return self.get_status()
 
@@ -104,8 +107,7 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
                 local_now = datetime.now(
                     tz=pytz.timezone(self.current_user.preferences.timezone)
                 )
-                offset = local_now.utcoffset() or timedelta(0)
-                return offset
+                return local_now.utcoffset() or timedelta(0)
             except (KeyError, ValueError):
                 pass
 
@@ -141,18 +143,28 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
         refresh_token: RefreshToken,
         access_token: str,
         user: User,
-        new_session=False,
+        *,
+        new_session: bool = False,
     ) -> None:
         """Set session cookies."""
+        if not self._webserver.auth:
+            raise RuntimeError("Auth is not set up, cannot set cookies.")
+
         now = utcnow()
 
         _header, _payload, signature = access_token.split(".")
 
-        expires = (
-            now + self._webserver.auth.session_expiry
-            if self._webserver.auth.session_expiry
-            else now + timedelta(days=3650)
-        )
+        # Use the refresh token's absolute session expiry (created_at +
+        # session_expiration) to ensure that even if the refresh token is rotated,
+        # the session does not get extended indefinitely.
+        if self._webserver.auth.session_expiry is not None:
+            expires = datetime.fromtimestamp(
+                refresh_token.created_at
+                + refresh_token.session_expiration.total_seconds(),
+                tz=now.tzinfo,
+            )
+        else:
+            expires = now + timedelta(days=3650)
         # Refresh all cookies on every request if expiry is None because you can't have
         # infinite cookies in some browsers
         if new_session or self._webserver.auth.session_expiry is None:
@@ -203,12 +215,28 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
             self.clear_cookie(name, *kwargs)
 
     def validate_access_token(
-        self, access_token: str, check_refresh_token: bool = True
-    ):
+        self, access_token: str, *, check_refresh_token: bool = True
+    ) -> bool:
         """Validate access token."""
+        if not self._webserver.auth:
+            raise RuntimeError("Auth is not set up, cannot validate access token.")
+
         # Check access token is valid
         refresh_token = self._webserver.auth.validate_access_token(access_token)
         if refresh_token is None:
+            # Non-browser requests may use a personal access token (PAT) instead of a
+            # JWT. PATs are not accepted in the browser flow (check_refresh_token=True)
+            # because they lack the cookie-binding security layer.
+            if not check_refresh_token:
+                pat = self._webserver.auth.validate_access_token_pat(access_token)
+                if pat is not None:
+                    user = self._webserver.auth.get_user(pat.user_id)
+                    if user is None or not user.enabled:
+                        LOGGER.debug("PAT owner not found or disabled")
+                        return False
+                    self.current_user = user
+                    self._webserver.auth.update_pat_used(pat, self.request.remote_ip)
+                    return True
             LOGGER.debug("Access token not valid")
             return False
 
@@ -217,7 +245,7 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
             refresh_token_cookie = self.get_secure_cookie("refresh_token")
             if refresh_token_cookie is None:
                 LOGGER.debug("Refresh token is missing")
-                return
+                return False
             if not hmac.compare_digest(
                 refresh_token_cookie.decode(), refresh_token.token
             ):
@@ -258,12 +286,11 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
         ):
             return cameras
 
-        filtered_cameras = {
+        return {
             camera_identifier: camera_instance
             for camera_identifier, camera_instance in cameras.items()
             if camera_identifier in self.current_user.assigned_cameras
         }
-        return filtered_cameras
 
     def get_cameras(self) -> None | dict[str, AbstractCamera]:
         """Get all registered camera instances."""
@@ -272,9 +299,9 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
     def _get_failed_cameras(self) -> None | dict[str, FailedCamera]:
         """Get all registered failed camera instances."""
         try:
-            failed_entries: dict[
-                str, DomainEntry
-            ] = self._vis.domain_registry.get_failed(CAMERA_DOMAIN)
+            failed_entries: dict[str, DomainEntry] = (
+                self._vis.domain_registry.get_failed(CAMERA_DOMAIN)
+            )
         except DomainNotRegisteredError:
             return None
 
@@ -296,29 +323,25 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
         }
 
     @overload
-    def _get_camera(self, camera_identifier: str) -> AbstractCamera | None:
-        ...
+    def _get_camera(self, camera_identifier: str) -> AbstractCamera | None: ...
 
     @overload
     def _get_camera(
-        self, camera_identifier: str, failed: Literal[False]
-    ) -> AbstractCamera | None:
-        ...
+        self, camera_identifier: str, *, failed: Literal[False]
+    ) -> AbstractCamera | None: ...
 
     @overload
     def _get_camera(
-        self, camera_identifier: str, failed: Literal[True]
-    ) -> AbstractCamera | FailedCamera | None:
-        ...
+        self, camera_identifier: str, *, failed: Literal[True]
+    ) -> AbstractCamera | FailedCamera | None: ...
 
     @overload
     def _get_camera(
-        self, camera_identifier: str, failed: bool
-    ) -> AbstractCamera | FailedCamera | None:
-        ...
+        self, camera_identifier: str, *, failed: bool
+    ) -> AbstractCamera | FailedCamera | None: ...
 
     def _get_camera(
-        self, camera_identifier: str, failed: bool = False
+        self, camera_identifier: str, *, failed: bool = False
     ) -> AbstractCamera | FailedCamera | None:
         """Get camera instance.
 
@@ -350,32 +373,28 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
         return None
 
     @overload
-    def get_camera(self, camera_identifier: str) -> AbstractCamera | None:
-        ...
+    def get_camera(self, camera_identifier: str) -> AbstractCamera | None: ...
 
     @overload
     def get_camera(
-        self, camera_identifier: str, failed: Literal[False]
-    ) -> AbstractCamera | None:
-        ...
+        self, camera_identifier: str, *, failed: Literal[False]
+    ) -> AbstractCamera | None: ...
 
     @overload
     def get_camera(
-        self, camera_identifier: str, failed: Literal[True]
-    ) -> AbstractCamera | FailedCamera | None:
-        ...
+        self, camera_identifier: str, *, failed: Literal[True]
+    ) -> AbstractCamera | FailedCamera | None: ...
 
     @overload
     def get_camera(
-        self, camera_identifier: str, failed: bool
-    ) -> AbstractCamera | FailedCamera | None:
-        ...
+        self, camera_identifier: str, *, failed: bool
+    ) -> AbstractCamera | FailedCamera | None: ...
 
     def get_camera(
-        self, camera_identifier: str, failed: bool = False
+        self, camera_identifier: str, *, failed: bool = False
     ) -> AbstractCamera | FailedCamera | None:
         """Get camera instance."""
-        return self._get_camera(camera_identifier, failed)
+        return self._get_camera(camera_identifier, failed=failed)
 
     def get_nvr(self, camera_identifier: str) -> NVR | None:
         """Get NVR instance for camera."""
@@ -396,12 +415,27 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
         return self._get_session()
 
     def validate_camera_token(self, camera: AbstractCamera) -> bool:
-        """Validate camera token."""
+        """Validate camera token.
+
+        Accepts, in order:
+        1. Short-lived per-camera token via ?access_token= query parameter.
+        2. Personal access token (PAT) via Authorization: Bearer <vpat_...>
+           header. PATs respect the owning user's role and assigned_cameras.
+        3. Cookie based session (refresh_token + static_asset_key).
+        """
+        if not self._webserver.auth:
+            raise RuntimeError("Auth is not set up, cannot validate camera token.")
+
         access_token = self.get_argument("access_token", None, strip=True)
         if access_token:
-            if access_token in camera.access_tokens:
+            return access_token in camera.access_tokens
+
+        # Allow PAT via Authorization header for non-browser clients.
+        auth_header = self.request.headers.get("Authorization", None)
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[len("Bearer ") :].strip()
+            if token.startswith("vpat_") and self._validate_camera_pat(token, camera):
                 return True
-            return False
 
         # Access token query parameter not set, check cookies
         refresh_token_cookie = self.get_secure_cookie("refresh_token")
@@ -410,8 +444,38 @@ class ViseronRequestHandler(tornado.web.RequestHandler):
             refresh_token = self._webserver.auth.get_refresh_token_from_token(
                 refresh_token_cookie.decode()
             )
-            if hmac.compare_digest(
+            if refresh_token and hmac.compare_digest(
                 refresh_token.static_asset_key, static_asset_key.decode()
             ):
                 return True
         return False
+
+    def _validate_camera_pat(self, raw_token: str, camera: AbstractCamera) -> bool:
+        """Validate a PAT and check that its owner may access camera."""
+        pat = self._webserver.auth.validate_access_token_pat(raw_token)
+        if pat is None:
+            return False
+
+        user = self._webserver.auth.get_user(pat.user_id)
+        if user is None or not user.enabled:
+            LOGGER.debug("PAT owner not found or disabled")
+            return False
+
+        if (
+            user.role != Role.ADMIN
+            and user.assigned_cameras is not None
+            and camera.identifier not in user.assigned_cameras
+        ):
+            LOGGER.debug(
+                "PAT user %s not permitted to access camera %s",
+                user.id,
+                camera.identifier,
+            )
+            return False
+
+        self.current_user = user
+        self._webserver.auth.update_pat_used(pat, self.request.remote_ip)
+        LOGGER.debug(
+            "Camera %s accessed via PAT by user %s", camera.identifier, user.id
+        )
+        return True
