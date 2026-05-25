@@ -16,6 +16,7 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
@@ -58,10 +59,15 @@ class TierCheckWorker(SubProcessWorker):
         self._cpulimit = cpulimit
         self._workers = workers
         # OrderedDict so we can FIFO-evict old entries if the cap is hit.
+        # send_command (caller thread) and work_output (subprocess output
+        # thread) both mutate this dict, so all access is guarded by
+        # _callbacks_lock to keep the insert+len+popitem sequence atomic
+        # against concurrent pops.
         self._callbacks: OrderedDict[
             str,
             "Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]",
         ] = OrderedDict()
+        self._callbacks_lock = threading.Lock()
         # Monotonic callback IDs. Previously str(id(callback)) — bound
         # methods like self.on_check_tier_result are created lazily at
         # attribute access; CPython is free to reuse the address once a
@@ -112,24 +118,30 @@ class TierCheckWorker(SubProcessWorker):
         | None,
     ) -> None:
         """Forward a job to the subprocess, remembering its callback."""
+        evicted: str | None = None
+        size_to_log: int | None = None
         if callback is not None:
             item.callback_id = str(next(self._next_callback_id))
-            self._callbacks[item.callback_id] = callback
-            if len(self._callbacks) > MAX_PENDING_CALLBACKS:
-                evicted, _ = self._callbacks.popitem(last=False)
-                LOGGER.debug(
-                    "TierCheckWorker _callbacks cap hit, evicted oldest %s", evicted
-                )
-            size = len(self._callbacks)
-            if size >= self._next_callbacks_log_threshold:
-                LOGGER.warning(
-                    "TierCheckWorker pending callbacks dict size: %d "
-                    "(latest cmd=%s cam=%s)",
-                    size,
-                    getattr(item, "cmd", None),
-                    getattr(item, "camera_identifier", None),
-                )
-                self._next_callbacks_log_threshold = size * 2
+            with self._callbacks_lock:
+                self._callbacks[item.callback_id] = callback
+                if len(self._callbacks) > MAX_PENDING_CALLBACKS:
+                    evicted, _ = self._callbacks.popitem(last=False)
+                size = len(self._callbacks)
+                if size >= self._next_callbacks_log_threshold:
+                    size_to_log = size
+                    self._next_callbacks_log_threshold = size * 2
+        if evicted is not None:
+            LOGGER.debug(
+                "TierCheckWorker _callbacks cap hit, evicted oldest %s", evicted
+            )
+        if size_to_log is not None:
+            LOGGER.warning(
+                "TierCheckWorker pending callbacks dict size: %d "
+                "(latest cmd=%s cam=%s)",
+                size_to_log,
+                getattr(item, "cmd", None),
+                getattr(item, "camera_identifier", None),
+            )
         self.input_queue.put(item)
 
     def work_output(
@@ -138,6 +150,7 @@ class TierCheckWorker(SubProcessWorker):
         """Dispatch the subprocess's reply to the original caller."""
         if not item.callback_id:
             return
-        callback = self._callbacks.pop(item.callback_id, None)
+        with self._callbacks_lock:
+            callback = self._callbacks.pop(item.callback_id, None)
         if callback:
             callback(item)
