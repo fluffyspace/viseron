@@ -15,6 +15,7 @@ import argparse
 import ctypes
 import ctypes.util
 import datetime
+import errno
 import gc
 import logging
 import multiprocessing as mp
@@ -210,38 +211,6 @@ RECORDINGS_TABLE = Table(
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(tz=datetime.timezone.utc)
-
-
-_HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
-
-
-def _drop_file_cache(path: str, *, fsync: bool) -> None:
-    """Best-effort: evict ``path`` from the kernel page cache.
-
-    ``fsync=True`` flushes dirty pages first so POSIX_FADV_DONTNEED can
-    actually drop them (the kernel only evicts clean pages). For
-    just-copied destinations this also makes the move durable across
-    crashes. Silent on platforms without posix_fadvise or when the
-    file has already been unlinked.
-    """
-    if not _HAS_POSIX_FADVISE:
-        return
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        if fsync:
-            try:
-                os.fdatasync(fd)
-            except OSError:
-                pass
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        except OSError:
-            pass
-    finally:
-        os.close(fd)
 
 
 class DedupCheckQueue:
@@ -1056,7 +1025,18 @@ class Worker:
                     LOGGER.exception("malloc_trim failed")
 
     def move_file(self, item: DataItemMoveFile) -> None:
-        """Copy src to dst, then unlink src.
+        """Move src to dst.
+
+        Fast path: ``os.rename`` is atomic and metadata-only when src
+        and dst share a filesystem — no data is read or written, so no
+        page cache is populated. For configurations where tiers live
+        on the same disk (e.g., subdirectories of one mount) this is
+        the common case and avoids the cache-balloon problem entirely.
+
+        Cross-filesystem moves (``EXDEV``) fall back to ``shutil.copy``
+        + unlink. The fallback still leaves the file in the kernel
+        page cache, but is only triggered when tiers actually span
+        different filesystems.
 
         Cases:
         - Source already gone (FileNotFoundError): the move goal is
@@ -1077,15 +1057,13 @@ class Worker:
             return
         try:
             os.makedirs(os.path.dirname(item.dst), exist_ok=True)
-            shutil.copy(item.src, item.dst)
-            # Tier moves are read+write of whole recording files; without
-            # eviction, each move leaves ~recording-size of page cache
-            # charged to our cgroup. The kernel then steals anon from
-            # neighbouring containers via swap. fdatasync makes dst pages
-            # clean so POSIX_FADV_DONTNEED can actually drop them.
-            _drop_file_cache(item.dst, fsync=True)
-            _drop_file_cache(item.src, fsync=False)
-            os.remove(item.src)
+            try:
+                os.rename(item.src, item.dst)
+            except OSError as rename_error:
+                if rename_error.errno != errno.EXDEV:
+                    raise
+                shutil.copy(item.src, item.dst)
+                os.remove(item.src)
         except FileNotFoundError:
             self._delete_db_row(item.src)
             return
