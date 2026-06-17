@@ -695,9 +695,11 @@ def delete_file(
 
     try:
         os.remove(path)
-    except FileNotFoundError as error:
-        logger.debug(f"Failed to delete file {path}: {error}")
-        raise error
+    except FileNotFoundError:
+        # The file is already gone, which is exactly the goal of a delete.
+        # The DB row was removed above, so treat this as success rather than
+        # raising — re-raising here just produces noise in work_input.
+        logger.debug("File %s already absent, nothing to delete", path)
 
 
 def move_file(
@@ -718,12 +720,15 @@ def move_file(
         shutil.copy(src, dst)
         os.remove(src)
     except FileNotFoundError as error:
-        logger.debug(f"Failed to move file {src} to {dst}: {error}")
+        # Source is already gone, so there is nothing to move. Drop the now
+        # stale DB row and return — a missing source is the success case for a
+        # move/cleanup job, not a failure, so we do not re-raise. Genuine I/O
+        # failures are still handled (and re-raised) by the OSError branch.
+        logger.debug("File %s already absent, nothing to move: %s", src, error)
         with get_session() as session:
             stmt = delete(Files).where(Files.path == src)
             session.execute(stmt)
             session.commit()
-        raise error
     except OSError as error:
         logger.debug(f"Failed to move file {src} to {dst}: {error}")
         with get_session() as session:
